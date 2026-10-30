@@ -7,6 +7,7 @@ import authRouter from "./src/routes/authRoutes.js";
 import roomRouter from "./src/routes/roomRoutes.js";
 import hostellerRouter from "./src/routes/hostellerRoutes.js";
 import feeRouter from "./src/routes/feeRoutes.js";
+import reportRouter from "./src/routes/reportRoutes.js";
 import apiLogger from "./src/middlewares/apiLogger.js";
 import { errorHandler } from "./src/middlewares/errorHandler.js";
 import { notFound } from "./src/middlewares/notFound.js";
@@ -33,6 +34,7 @@ app.use("/auth", authRouter);
 app.use("/",roomRouter);
 app.use("/hostellers", hostellerRouter);
 app.use("/fees", feeRouter);
+app.use("/reports", reportRouter);
 app.use(notFound);
 app.use(errorHandler);
 
