@@ -14,6 +14,7 @@ export const adminLogin = async (req, res) => {
         ) {
             return res.status(400).json({
                 success: false,
+                statusCode: 400,
                 message: "Email and password are required",
             });
         }
@@ -34,6 +35,7 @@ export const adminLogin = async (req, res) => {
         if (result.rowCount === 0) {
             return res.status(401).json({
                 success: false,
+                statusCode: 401,
                 message: "Invalid email or password",
             });
         }
@@ -48,6 +50,7 @@ export const adminLogin = async (req, res) => {
         if (!isPasswordValid) {
             return res.status(401).json({
                 success: false,
+                statusCode: 401,
                 message: "Invalid email or password",
             });
         }
@@ -66,6 +69,7 @@ export const adminLogin = async (req, res) => {
 
         return res.status(200).json({
             success: true,
+            statusCode: 200,
             message: "Admin login successful",
             data: {
                 admin: {
