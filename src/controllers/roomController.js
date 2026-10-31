@@ -46,14 +46,19 @@ export const createRoom = async (req, res) => {
     try {
         await client.query("BEGIN");
 
-        // Find an existing building, ignoring letter case.
+        const cleanBuildingName = building_name.trim().replace(/\s+/g, " ");
+        const cleanFloor = floor.trim().replace(/\s+/g, " ");
+        const cleanRoomNumber = room_number.trim().replace(/\s+/g, " ");
+
+        // Find existing active building.
         const existingBuilding = await client.query(
             `SELECT building_id, building_name
              FROM tbl_buildings
-             WHERE LOWER(building_name) = LOWER($1)
+             WHERE LOWER(TRIM(building_name)) = LOWER($1)
                AND status = 'ACTIVE'
-             LIMIT 1`,
-            [building_name.trim()]
+             LIMIT 1
+             FOR UPDATE`,
+            [cleanBuildingName]
         );
 
         let building;
@@ -61,18 +66,37 @@ export const createRoom = async (req, res) => {
         if (existingBuilding.rowCount > 0) {
             building = existingBuilding.rows[0];
         } else {
-            // Create building if it does not exist.
             const buildingResult = await client.query(
                 `INSERT INTO tbl_buildings (building_name)
                  VALUES ($1)
                  RETURNING building_id, building_name, status`,
-                [building_name.trim()]
+                [cleanBuildingName]
             );
 
             building = buildingResult.rows[0];
         }
 
-        // Save the room details separately.
+        // Check duplicate room number in the same building.
+        const existingRoom = await client.query(
+            `SELECT room_id, room_number
+             FROM tbl_rooms
+             WHERE building_id = $1
+               AND LOWER(TRIM(room_number)) = LOWER($2)
+             LIMIT 1`,
+            [building.building_id, cleanRoomNumber]
+        );
+
+        if (existingRoom.rowCount > 0) {
+            await client.query("ROLLBACK");
+
+            return sendErrorResponse(
+                res,
+                409,
+                `Room ${cleanRoomNumber} already exists in ${building.building_name}.`
+            );
+        }
+
+        // Insert room.
         const roomResult = await client.query(
             `INSERT INTO tbl_rooms (
                 building_id,
@@ -85,8 +109,8 @@ export const createRoom = async (req, res) => {
             RETURNING *`,
             [
                 building.building_id,
-                floor.trim(),
-                room_number.trim(),
+                cleanFloor,
+                cleanRoomNumber,
                 Number(sharing_type),
                 Number(monthly_cost)
             ]
@@ -103,6 +127,7 @@ export const createRoom = async (req, res) => {
                 room: roomResult.rows[0]
             }
         );
+
     } catch (error) {
         await client.query("ROLLBACK");
 
@@ -110,7 +135,7 @@ export const createRoom = async (req, res) => {
             return sendErrorResponse(
                 res,
                 409,
-                "Room number already exists in this building"
+                "This room number already exists in the selected building."
             );
         }
 
@@ -129,6 +154,7 @@ export const createRoom = async (req, res) => {
             500,
             "Internal server error"
         );
+
     } finally {
         client.release();
     }

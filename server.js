@@ -25,6 +25,7 @@ app.use(apiLogger);
 
 app.get("/", (req, res) => {
   return res.status(200).json({
+    statusCode: 200,
     message: "Server is up and running"
   });
 });
