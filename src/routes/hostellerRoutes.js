@@ -5,7 +5,6 @@ import {
     getAllHostellers,
     getHostellerById,
     updateHosteller,
-    changeHostellerRoom,
     vacateHosteller,
     getHostellerAllocationHistory,
     deleteHosteller
@@ -26,10 +25,6 @@ hostellerRouter.get(
     getHostellerAllocationHistory
 );
 
-hostellerRouter.patch(
-    "/:hostellerId/room",
-    changeHostellerRoom
-);
 
 hostellerRouter.patch(
     "/:hostellerId/vacate",
