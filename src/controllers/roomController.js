@@ -122,10 +122,10 @@ export const createRoom = async (req, res) => {
             res,
             201,
             "Building and room saved successfully",
-            {
-                building,
-                room: roomResult.rows[0]
-            }
+            // {
+            //     building,
+            //     room: roomResult.rows[0]
+            // }
         );
 
     } catch (error) {
@@ -559,8 +559,8 @@ export const updateRoom = async (req, res) => {
         return sendSuccessResponse(
             res,
             200,
-            "Room updated successfully",
-            result.rows[0]
+            "Room updated successfully"
+            // result.rows[0]
         );
     } catch (error) {
         if (error.code === "23505") {

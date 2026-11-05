@@ -221,109 +221,237 @@ async function getHostellerStatus(client, hostellerId, lock = false) {
 }
 
 // POST /hostellers
-export async function createHosteller(req, res) {
-    const data = req.body;
+export const createHosteller = async (req, res) => {
+    const {
+        full_name,
+        aadhar_number,
+        phone_number,
+        building_id,
+        floor,
+        room_no,
+        fee_plan,
+        join_date
+    } = req.body;
 
-    const errors = validatePersonalData(data, true);
+    // Validate request body
+    if (
+        typeof full_name !== "string" ||
+        !full_name.trim() ||
 
-    if (errors.length) {
-        return sendErrorResponse(res, 400, "Validation failed", errors);
-    }
+        typeof aadhar_number !== "string" ||
+        !/^\d{12}$/.test(aadhar_number) ||
 
-    if (!isPositiveInteger(data.room_id)) {
-        return sendErrorResponse(res, 400, "A valid room_id is required");
-    }
+        typeof phone_number !== "string" ||
+        !/^\d{10}$/.test(phone_number) ||
 
-    if (data.join_date > new Date().toISOString().slice(0, 10)) {
-        return sendErrorResponse(res, 400, "join_date cannot be in the future");
+        !Number.isInteger(Number(building_id)) ||
+        Number(building_id) <= 0 ||
+
+        typeof floor !== "string" ||
+        !floor.trim() ||
+
+        typeof room_no !== "string" ||
+        !room_no.trim() ||
+
+        !["Monthly", "Weekly", "Day-wise"].includes(fee_plan) ||
+
+        !join_date ||
+        isNaN(Date.parse(join_date))
+    ) {
+        return sendErrorResponse(
+            res,
+            400,
+            "Please provide valid hosteller and room details."
+        );
     }
 
     const client = await pool.connect();
+    let transactionStarted = false;
 
     try {
         await client.query("BEGIN");
+        transactionStarted = true;
 
-        // Lock the room and check capacity before registering.
-        await ensureRoomHasSpace(client, Number(data.room_id));
+        // Find and lock selected room
+        const roomResult = await client.query(
+            `SELECT
+                r.room_id,
+                r.building_id,
+                r.floor,
+                r.room_number,
+                r.sharing_type,
+                r.monthly_cost,
+                r.beds_filled,
+                b.building_name
+             FROM tbl_rooms r
+             JOIN tbl_buildings b
+                ON b.building_id = r.building_id
+             WHERE r.building_id = $1
+               AND LOWER(TRIM(r.floor)) = LOWER(TRIM($2))
+               AND LOWER(TRIM(r.room_number)) = LOWER(TRIM($3))
+               AND r.status = 'ACTIVE'
+               AND b.status = 'ACTIVE'
+             FOR UPDATE OF r`,
+            [
+                Number(building_id),
+                floor.trim(),
+                room_no.trim()
+            ]
+        );
 
-        const insertResult = await client.query(
+        if (roomResult.rowCount === 0) {
+            await client.query("ROLLBACK");
+            transactionStarted = false;
+
+            return sendErrorResponse(
+                res,
+                404,
+                "Selected room not found or inactive."
+            );
+        }
+
+        const room = roomResult.rows[0];
+
+        // Check room availability
+        const occupiedResult = await client.query(
+            `SELECT COUNT(*)::INTEGER AS occupied_beds
+             FROM tbl_room_allocations
+             WHERE room_id = $1
+               AND status = 'ACTIVE'`,
+            [room.room_id]
+        );
+
+        const occupiedBeds = occupiedResult.rows[0].occupied_beds;
+
+        if (occupiedBeds >= room.sharing_type) {
+            await client.query("ROLLBACK");
+            transactionStarted = false;
+
+            return sendErrorResponse(
+                res,
+                409,
+                "Selected room is already full."
+            );
+        }
+
+        // Register hosteller
+        const hostellerResult = await client.query(
             `INSERT INTO tbl_hostellers (
                 full_name,
                 aadhar_number,
                 phone_number,
-                address,
-                emergency_contact_name,
-                emergency_contact_relationship,
-                emergency_contact_number,
                 join_date,
                 fee_plan,
                 number_of_days,
                 status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'Staying')
+            VALUES ($1, $2, $3, $4, $5, NULL, 'Staying')
             RETURNING *`,
             [
-                data.full_name.trim(),
-                data.aadhar_number,
-                data.phone_number,
-                data.address ?? null,
-                data.emergency_contact_name ?? null,
-                data.emergency_contact_relationship ?? null,
-                data.emergency_contact_number || null,
-                data.join_date,
-                data.fee_plan,
-                data.fee_plan === "Day-wise"
-                    ? Number(data.number_of_days)
-                    : null
+                full_name.trim(),
+                aadhar_number,
+                phone_number,
+                join_date,
+                fee_plan
             ]
         );
 
-        const hosteller = insertResult.rows[0];
+        const hosteller = hostellerResult.rows[0];
 
-        await client.query(
+        // Allocate room
+        const allocationResult = await client.query(
             `INSERT INTO tbl_room_allocations (
-                room_id, hosteller_id, allocation_date, status
+                room_id,
+                hosteller_id,
+                allocation_date,
+                status
             )
-            VALUES ($1, $2, $3, 'ACTIVE')`,
-            [Number(data.room_id), hosteller.hosteller_id, data.join_date]
+            VALUES ($1, $2, $3, 'ACTIVE')
+            RETURNING *`,
+            [
+                room.room_id,
+                hosteller.hosteller_id,
+                join_date
+            ]
+        );
+
+        // Update filled beds
+        await client.query(
+            `UPDATE tbl_rooms
+             SET beds_filled = $1,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE room_id = $2`,
+            [
+                occupiedBeds + 1,
+                room.room_id
+            ]
         );
 
         await client.query("COMMIT");
+        transactionStarted = false;
 
         return sendSuccessResponse(
             res,
             201,
             "Hosteller registered and room allocated successfully",
-            hosteller
+            {
+                hosteller,
+                allocation: allocationResult.rows[0],
+                room: {
+                    building_id: room.building_id,
+                    building_name: room.building_name,
+                    floor: room.floor,
+                    room_no: room.room_number,
+                    sharing_type: room.sharing_type,
+                    monthly_cost: room.monthly_cost,
+                    beds_filled: occupiedBeds + 1,
+                    available_beds:
+                        room.sharing_type - (occupiedBeds + 1)
+                }
+            }
         );
+
     } catch (error) {
-        await client.query("ROLLBACK");
+        if (transactionStarted) {
+            await client.query("ROLLBACK");
+        }
 
         if (error.code === "23505") {
             return sendErrorResponse(
                 res,
                 409,
-                "A hosteller with this Aadhar number or active allocation already exists"
+                "Hosteller with this Aadhar number already exists."
             );
         }
 
-        if (error.status) {
-            return sendErrorResponse(res, error.status, error.message);
+        if (error.code === "23503") {
+            return sendErrorResponse(
+                res,
+                400,
+                "Invalid building or room reference."
+            );
         }
 
-        console.error("createHosteller:", error);
+        console.error("Create hosteller error:", error);
 
-        return sendErrorResponse(res, 500, "Failed to register hosteller");
+        return sendErrorResponse(
+            res,
+            500,
+            "Internal server error"
+        );
+
     } finally {
         client.release();
     }
-}
+};
 
-// GET /hostellers?status=Staying&search=Ravi
+
+// GET ALL HOSTELLERS
 export async function getAllHostellers(req, res) {
     try {
         const { status, search } = req.query;
 
+        // Validate status
         if (
             status &&
             !HOSTELLER_STATUSES.includes(status)
@@ -338,13 +466,21 @@ export async function getAllHostellers(req, res) {
         const values = [];
         const conditions = [];
 
+        // Status filter
         if (status) {
             values.push(status);
-            conditions.push(`h.status = $${values.length}`);
+
+            conditions.push(
+                `h.status = $${values.length}`
+            );
         }
 
+        // Search filter
         if (search && String(search).trim()) {
-            values.push(`%${String(search).trim()}%`);
+            values.push(
+                `%${String(search).trim()}%`
+            );
+
             const index = values.length;
 
             conditions.push(`(
@@ -360,6 +496,7 @@ export async function getAllHostellers(req, res) {
             ? `WHERE ${conditions.join(" AND ")}`
             : "";
 
+        // Fetch hostellers
         const result = await pool.query(
             `SELECT
                 h.hosteller_id,
@@ -367,8 +504,6 @@ export async function getAllHostellers(req, res) {
                 h.aadhar_number,
                 h.phone_number,
                 h.address,
-                h.emergency_contact_name,
-                h.emergency_contact_relationship,
                 h.emergency_contact_number,
                 h.join_date,
                 h.fee_plan,
@@ -378,27 +513,40 @@ export async function getAllHostellers(req, res) {
                 h.vacating_reason,
                 h.vacating_remarks,
                 h.created_at,
+
                 r.room_id,
                 r.room_number,
                 r.floor,
                 r.sharing_type,
+
+                b.building_id,
                 b.building_name,
+
                 ra.allocation_id,
                 ra.allocation_date
-             FROM tbl_hostellers h
-             LEFT JOIN tbl_room_allocations ra
+
+            FROM tbl_hostellers h
+
+            LEFT JOIN tbl_room_allocations ra
                 ON ra.hosteller_id = h.hosteller_id
                 AND ra.status = 'ACTIVE'
-             LEFT JOIN tbl_rooms r ON r.room_id = ra.room_id
-             LEFT JOIN tbl_buildings b ON b.building_id = r.building_id
-             ${whereClause}
-             ORDER BY h.created_at DESC`,
+
+            LEFT JOIN tbl_rooms r
+                ON r.room_id = ra.room_id
+
+            LEFT JOIN tbl_buildings b
+                ON b.building_id = r.building_id
+
+            ${whereClause}
+
+            ORDER BY h.created_at DESC`,
             values
         );
 
-        // Avoid returning full Aadhar numbers in list responses.
+        // Mask Aadhar number in response
         const hostellers = result.rows.map((row) => ({
             ...row,
+
             aadhar_number: row.aadhar_number
                 ? `XXXX-XXXX-${row.aadhar_number.slice(-4)}`
                 : null
@@ -410,9 +558,15 @@ export async function getAllHostellers(req, res) {
             "Hostellers fetched successfully",
             hostellers
         );
+
     } catch (error) {
         console.error("getAllHostellers:", error);
-        return sendErrorResponse(res, 500, "Failed to fetch hostellers");
+
+        return sendErrorResponse(
+            res,
+            500,
+            "Failed to fetch hostellers"
+        );
     }
 }
 
