@@ -782,154 +782,167 @@ async function finalizeDueVacatings(client) {
 // PUT /hostellers/:hostellerId
 // Update personal, fee, joining and room details
 export async function updateHosteller(req, res) {
-  const hostellerId = getHostellerId(req, res);
+    const hostellerId = getHostellerId(req, res);
 
-  if (!hostellerId) return;
+    if (!hostellerId) return;
 
-  const data = req.body || {};
-  const keys = Object.keys(data);
+    const data = req.body || {};
+    const keys = Object.keys(data);
 
-  if (!keys.length) {
-    return sendErrorResponse(res, 400, "Provide at least one field to update");
-  }
-
-  // Check allowed fields
-  const forbidden = keys.filter(
-    (key) =>
-      !PERSONAL_FIELDS.includes(key) &&
-      !["room_id", "allocation_date"].includes(key),
-  );
-
-  if (forbidden.length) {
-    return sendErrorResponse(
-      res,
-      400,
-      `These fields cannot be updated here: ${forbidden.join(", ")}`,
-    );
-  }
-
-  const allowed = PERSONAL_FIELDS.filter((field) => Object.hasOwn(data, field));
-
-  const roomRequested = Object.hasOwn(data, "room_id");
-
-  const allocationDateRequested = Object.hasOwn(data, "allocation_date");
-
-  const joinDateRequested = Object.hasOwn(data, "join_date");
-
-  if (allocationDateRequested && !roomRequested) {
-    return sendErrorResponse(
-      res,
-      400,
-      "room_id is required when updating allocation_date",
-    );
-  }
-
-  // Validate personal fields
-  const errors = validatePersonalData(data);
-
-  if (errors.length) {
-    return sendErrorResponse(res, 400, "Validation failed", errors);
-  }
-
-  // Validate room fields
-  if (roomRequested && !isPositiveInteger(data.room_id)) {
-    return sendErrorResponse(res, 400, "A valid room_id is required");
-  }
-
-  if (allocationDateRequested && !isValidDate(data.allocation_date)) {
-    return sendErrorResponse(
-      res,
-      400,
-      "allocation_date must be a valid YYYY-MM-DD date",
-    );
-  }
-
-  const client = await pool.connect();
-
-  try {
-    await client.query("BEGIN");
-
-    const today = getTodayDate();
-
-    // Lock hosteller
-    const current = await getHostellerStatus(client, hostellerId);
-
-    if (current.status !== "Staying") {
-      fail(400, "Only staying hostellers can be updated");
+    if (!keys.length) {
+        return sendErrorResponse(res, 400, "Provide at least one field to update");
     }
 
-    // Calculate final joining date
-    const nextJoinDate = normalizeDateOnly(data.join_date ?? current.join_date);
+    // Check allowed fields
+    const forbidden = keys.filter(
+        (key) =>
+            !PERSONAL_FIELDS.includes(key) &&
+            !["room_id", "allocation_date"].includes(key)
+    );
 
-    // Calculate final fee details
-    const nextFeePlan = data.fee_plan ?? current.fee_plan;
+    if (forbidden.length) {
+        return sendErrorResponse(
+            res,
+            400,
+            `These fields cannot be updated here: ${forbidden.join(", ")}`
+        );
+    }
 
-    const nextDays = Object.hasOwn(data, "number_of_days")
-      ? data.number_of_days
-      : Object.hasOwn(data, "fee_plan") && data.fee_plan !== "Day-wise"
-        ? null
-        : current.number_of_days;
+    const allowed = PERSONAL_FIELDS.filter((field) =>
+        Object.hasOwn(data, field)
+    );
 
-    // Validate joining date ONLY when supplied
-    if (joinDateRequested) {
-      if (!isValidDate(nextJoinDate)) {
-        fail(400, "join_date must be a valid YYYY-MM-DD date");
-      }
+    const roomRequested = Object.hasOwn(data, "room_id");
+    const allocationDateRequested = Object.hasOwn(data, "allocation_date");
+    const joinDateRequested = Object.hasOwn(data, "join_date");
 
-      if (nextJoinDate > today) {
-        fail(400, `join_date cannot be in the future. Today is ${today}`);
-      }
+    if (allocationDateRequested && !roomRequested) {
+        return sendErrorResponse(
+            res,
+            400,
+            "room_id is required when updating allocation_date"
+        );
+    }
 
-      // Validate join date against first allocation
-      const allocationResult = await client.query(
-        `SELECT allocation_date
+    // Validate personal fields
+    const errors = validatePersonalData(data);
+
+    if (errors.length) {
+        return sendErrorResponse(res, 400, "Validation failed", errors);
+    }
+
+    // Validate room fields
+    if (roomRequested && !isPositiveInteger(data.room_id)) {
+        return sendErrorResponse(res, 400, "A valid room_id is required");
+    }
+
+    if (
+        allocationDateRequested &&
+        !isValidDate(data.allocation_date)
+    ) {
+        return sendErrorResponse(
+            res,
+            400,
+            "allocation_date must be a valid YYYY-MM-DD date"
+        );
+    }
+
+    const client = await pool.connect();
+
+    try {
+        await client.query("BEGIN");
+
+        const today = getTodayDate();
+
+        // Lock hosteller
+        const current = await getHostellerStatus(client, hostellerId, true);
+
+        if (!current) {
+            fail(404, "Hosteller not found");
+        }
+
+        if (current.status !== "Staying") {
+            fail(400, "Only staying hostellers can be updated");
+        }
+
+        // Calculate final joining date
+        const nextJoinDate = normalizeDateOnly(
+            data.join_date ?? current.join_date
+        );
+
+        // Calculate final fee details
+        const nextFeePlan = data.fee_plan ?? current.fee_plan;
+
+        const nextDays = Object.hasOwn(data, "number_of_days")
+            ? data.number_of_days
+            : Object.hasOwn(data, "fee_plan") && data.fee_plan !== "Day-wise"
+                ? null
+                : current.number_of_days;
+
+        // Validate joining date
+        if (joinDateRequested) {
+            if (!isValidDate(nextJoinDate)) {
+                fail(400, "join_date must be a valid YYYY-MM-DD date");
+            }
+
+            if (nextJoinDate > today) {
+                fail(400, `join_date cannot be in the future. Today is ${today}`);
+            }
+
+            const allocationResult = await client.query(
+                `SELECT allocation_date
                  FROM tbl_room_allocations
                  WHERE hosteller_id = $1
                  ORDER BY allocation_date ASC
                  LIMIT 1`,
-        [hostellerId],
-      );
+                [hostellerId]
+            );
 
-      if (allocationResult.rows.length) {
-        const firstAllocationDate = normalizeDateOnly(
-          allocationResult.rows[0].allocation_date,
-        );
+            if (allocationResult.rows.length) {
+                const firstAllocationDate = normalizeDateOnly(
+                    allocationResult.rows[0].allocation_date
+                );
 
-        if (nextJoinDate > firstAllocationDate) {
-          fail(
-            400,
-            "join_date cannot be later than the first room allocation date",
-          );
+                if (nextJoinDate > firstAllocationDate) {
+                    fail(
+                        400,
+                        "join_date cannot be later than the first room allocation date"
+                    );
+                }
+            }
         }
-      }
-    }
 
-    // Validate Day-wise plan
-    if (
-      nextFeePlan === "Day-wise" &&
-      (!isPositiveInteger(nextDays) || Number(nextDays) > 365)
-    ) {
-      fail(400, "Day-wise fee plans require number_of_days between 1 and 365");
-    }
+        // Validate Day-wise plan
+        if (
+            nextFeePlan === "Day-wise" &&
+            (!isPositiveInteger(nextDays) || Number(nextDays) > 365)
+        ) {
+            fail(
+                400,
+                "Day-wise fee plans require number_of_days between 1 and 365"
+            );
+        }
 
-    if (
-      nextFeePlan !== "Day-wise" &&
-      Object.hasOwn(data, "number_of_days") &&
-      data.number_of_days != null
-    ) {
-      fail(400, "number_of_days is only valid for a Day-wise plan");
-    }
+        if (
+            nextFeePlan !== "Day-wise" &&
+            Object.hasOwn(data, "number_of_days") &&
+            data.number_of_days != null
+        ) {
+            fail(400, "number_of_days is only valid for a Day-wise plan");
+        }
 
-    const finalDays = nextFeePlan === "Day-wise" ? Number(nextDays) : null;
+        const finalDays =
+            nextFeePlan === "Day-wise" ? Number(nextDays) : null;
 
-    let oldRoomId = null;
-    let newRoomId = null;
-    let updatedAllocation = null;
+        let oldRoomId = null;
+        let newRoomId = null;
+        let updatedAllocation = null;
+        let roomChanged = false;
 
-    // Handle room change
-    if (roomRequested) {
-      const currentAllocationResult = await client.query(
-        `SELECT
+        // Handle room selection/change
+        if (roomRequested) {
+            const currentAllocationResult = await client.query(
+                `SELECT
                     allocation_id,
                     room_id,
                     allocation_date
@@ -937,164 +950,179 @@ export async function updateHosteller(req, res) {
                  WHERE hosteller_id = $1
                    AND status = 'ACTIVE'
                  FOR UPDATE`,
-        [hostellerId],
-      );
+                [hostellerId]
+            );
 
-      if (!currentAllocationResult.rows.length) {
-        fail(409, "No active room allocation exists for this hosteller");
-      }
+            if (!currentAllocationResult.rows.length) {
+                fail(409, "No active room allocation exists for this hosteller");
+            }
 
-      const currentAllocation = currentAllocationResult.rows[0];
+            const currentAllocation = currentAllocationResult.rows[0];
 
-      oldRoomId = Number(currentAllocation.room_id);
-      newRoomId = Number(data.room_id);
+            oldRoomId = Number(currentAllocation.room_id);
+            newRoomId = Number(data.room_id);
 
-      if (oldRoomId === newRoomId) {
-        fail(400, "Hosteller is already allocated to this room");
-      }
+            // Same room: do not create another allocation.
+            // Continue updating personal and fee details.
+            if (oldRoomId !== newRoomId) {
+                roomChanged = true;
 
-      const newAllocationDate = data.allocation_date || today;
+                const newAllocationDate = data.allocation_date || today;
 
-      const currentAllocationDate = normalizeDateOnly(
-        currentAllocation.allocation_date,
-      );
+                const currentAllocationDate = normalizeDateOnly(
+                    currentAllocation.allocation_date
+                );
 
-      if (newAllocationDate > today) {
-        fail(400, "allocation_date cannot be in the future");
-      }
+                if (newAllocationDate > today) {
+                    fail(400, "allocation_date cannot be in the future");
+                }
 
-      if (
-        newAllocationDate < currentAllocationDate ||
-        newAllocationDate < nextJoinDate
-      ) {
-        fail(
-          400,
-          "New allocation date cannot be earlier than the current allocation or join date",
-        );
-      }
+                if (
+                    newAllocationDate < currentAllocationDate ||
+                    newAllocationDate < nextJoinDate
+                ) {
+                    fail(
+                        400,
+                        "New allocation date cannot be earlier than the current allocation or join date"
+                    );
+                }
 
-      // Check and lock new room before closing old allocation
-      await ensureRoomHasSpace(client, newRoomId);
+                // Check and lock new room
+                await ensureRoomHasSpace(client, newRoomId);
 
-      // Close previous allocation
-      await client.query(
-        `UPDATE tbl_room_allocations
-                 SET status = 'VACATED',
-                     vacated_date = $1,
-                     updated_at = CURRENT_TIMESTAMP
-                 WHERE allocation_id = $2`,
-        [newAllocationDate, currentAllocation.allocation_id],
-      );
+                // Close previous allocation
+                await client.query(
+                    `UPDATE tbl_room_allocations
+                     SET status = 'VACATED',
+                         vacated_date = $1,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE allocation_id = $2`,
+                    [newAllocationDate, currentAllocation.allocation_id]
+                );
 
-      // Create new allocation
-      const allocationResult = await client.query(
-        `INSERT INTO tbl_room_allocations (
-                    room_id,
-                    hosteller_id,
-                    allocation_date,
-                    status
-                 )
-                 VALUES ($1, $2, $3, 'ACTIVE')
-                 RETURNING *`,
-        [newRoomId, hostellerId, newAllocationDate],
-      );
+                // Create new allocation
+                const allocationResult = await client.query(
+                    `INSERT INTO tbl_room_allocations (
+                        room_id,
+                        hosteller_id,
+                        allocation_date,
+                        status
+                    )
+                    VALUES ($1, $2, $3, 'ACTIVE')
+                    RETURNING *`,
+                    [newRoomId, hostellerId, newAllocationDate]
+                );
 
-      updatedAllocation = allocationResult.rows[0];
+                updatedAllocation = allocationResult.rows[0];
 
-      // Update room bed counts
-      await updateRoomBedsFilled(client, oldRoomId);
-      await updateRoomBedsFilled(client, newRoomId);
-    }
+                // Update room bed counts
+                await updateRoomBedsFilled(client, oldRoomId);
+                await updateRoomBedsFilled(client, newRoomId);
+            } else {
+                // Same room: return existing allocation
+                updatedAllocation = currentAllocation;
+            }
+        }
 
-    // Update personal and fee details
-    const values = [];
-    const assignments = [];
+        // Update personal and fee details
+        const values = [];
+        const assignments = [];
 
-    for (const field of allowed) {
-      let value = data[field];
+        for (const field of allowed) {
+            let value = data[field];
 
-      if (field === "full_name") {
-        value = value.trim();
-      }
+            if (field === "full_name") {
+                value = value.trim();
+            }
 
-      if (field === "fee_plan") {
-        value = nextFeePlan;
-      }
+            if (field === "fee_plan") {
+                value = nextFeePlan;
+            }
 
-      if (field === "join_date") {
-        value = nextJoinDate;
-      }
+            if (field === "join_date") {
+                value = nextJoinDate;
+            }
 
-      if (field === "number_of_days") {
-        value = finalDays;
-      }
+            if (field === "number_of_days") {
+                value = finalDays;
+            }
 
-      if (field === "address" || field === "emergency_contact_number") {
-        value = value === "" ? null : value;
-      }
+            if (
+                field === "address" ||
+                field === "emergency_contact_number"
+            ) {
+                value = value === "" ? null : value;
+            }
 
-      values.push(value);
+            values.push(value);
+            assignments.push(`${field} = $${values.length}`);
+        }
 
-      assignments.push(`${field} = $${values.length}`);
-    }
+        // Update number_of_days when fee_plan changes
+        if (
+            !allowed.includes("number_of_days") &&
+            allowed.includes("fee_plan")
+        ) {
+            values.push(finalDays);
+            assignments.push(`number_of_days = $${values.length}`);
+        }
 
-    // Update number_of_days when fee_plan changes
-    if (!allowed.includes("number_of_days") && allowed.includes("fee_plan")) {
-      values.push(finalDays);
+        let updatedHosteller = current;
 
-      assignments.push(`number_of_days = $${values.length}`);
-    }
+        if (assignments.length) {
+            values.push(hostellerId);
 
-    let updatedHosteller = current;
-
-    if (assignments.length) {
-      values.push(hostellerId);
-
-      const updateResult = await client.query(
-        `UPDATE tbl_hostellers
+            const updateResult = await client.query(
+                `UPDATE tbl_hostellers
                  SET ${assignments.join(", ")},
                      updated_at = CURRENT_TIMESTAMP
                  WHERE hosteller_id = $${values.length}
                  RETURNING *`,
-        values,
-      );
+                values
+            );
 
-      updatedHosteller = updateResult.rows[0];
+            updatedHosteller = updateResult.rows[0];
+        } else if (!roomRequested) {
+            fail(400, "Provide at least one field to update");
+        }
+
+        await client.query("COMMIT");
+
+        return sendSuccessResponse(
+            res,
+            200,
+            roomChanged
+                ? "Hosteller details and room updated successfully"
+                : "Hosteller details updated successfully",
+            {
+                hosteller: updatedHosteller,
+                allocation: updatedAllocation
+            }
+        );
+
+    } catch (error) {
+        await client.query("ROLLBACK");
+
+        if (error.code === "23505") {
+            return sendErrorResponse(
+                res,
+                409,
+                "A hosteller with this Aadhar number already exists"
+            );
+        }
+
+        console.error("updateHosteller:", error);
+
+        return sendErrorResponse(
+            res,
+            error.status || 500,
+            error.status ? error.message : "Failed to update hosteller"
+        );
+    } finally {
+        client.release();
     }
-
-    await client.query("COMMIT");
-
-    return sendSuccessResponse(
-      res,
-      200,
-      "Hosteller updated successfully",
-      // {
-      //     hosteller: updatedHosteller,
-      //     allocation: updatedAllocation
-      // }
-    );
-  } catch (error) {
-    await client.query("ROLLBACK");
-
-    if (error.code === "23505") {
-      return sendErrorResponse(
-        res,
-        409,
-        "A hosteller with this Aadhar number already exists",
-      );
-    }
-
-    console.error("updateHosteller:", error);
-
-    return sendErrorResponse(
-      res,
-      error.status || 500,
-      error.status ? error.message : "Failed to update hosteller",
-    );
-  } finally {
-    client.release();
-  }
 }
+
 
 // PATCH /hostellers/:hostellerId/vacate
 export async function vacateHosteller(req, res) {
