@@ -5,7 +5,7 @@ const PHONE_REGEX = /^\d{10}$/;
 const AADHAR_REGEX = /^\d{12}$/;
 const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 
-const FEE_PLANS = ["Monthly", "Weekly", "Day-wise"];
+const FEE_PLANS = ["Monthly", "Day-wise"];
 const HOSTELLER_STATUSES = ["Staying", "Vacating", "Vacated"];
 
 const VACATING_REASONS = [
@@ -104,7 +104,7 @@ function validatePersonalData(data, isCreate = false) {
   }
 
   if (data.fee_plan !== undefined && !FEE_PLANS.includes(data.fee_plan)) {
-    errors.push("fee_plan must be Monthly, Weekly or Day-wise");
+    errors.push("fee_plan must be Monthly or Day-wise");
   }
 
   if (data.fee_plan === "Day-wise") {
@@ -251,61 +251,95 @@ async function getHostellerStatus(client, hostellerId, lock = false) {
   return result.rows[0];
 }
 
+
 // POST /hostellers
 export const createHosteller = async (req, res) => {
-  const {
-    full_name,
-    aadhar_number,
-    phone_number,
-    address,
-    emergency_contact_number,
-    building_id,
-    floor,
-    room_no,
-    fee_plan,
-    join_date,
-  } = req.body;
+    const {
+        full_name,
+        aadhar_number,
+        phone_number,
+        address,
+        emergency_contact_number,
+        building_id,
+        floor,
+        room_no,
+        fee_plan,
+        number_of_days,
+        join_date
+    } = req.body;
 
-  // Validate request body
-  if (
-    typeof full_name !== "string" ||
-    !full_name.trim() ||
-    typeof aadhar_number !== "string" ||
-    !/^\d{12}$/.test(aadhar_number) ||
-    typeof phone_number !== "string" ||
-    !/^\d{10}$/.test(phone_number) ||
-    (address != null && typeof address !== "string") ||
-    (emergency_contact_number != null &&
-      emergency_contact_number !== "" &&
-      (typeof emergency_contact_number !== "string" ||
-        !/^\d{10}$/.test(emergency_contact_number))) ||
-    !Number.isInteger(Number(building_id)) ||
-    Number(building_id) <= 0 ||
-    typeof floor !== "string" ||
-    !floor.trim() ||
-    typeof room_no !== "string" ||
-    !room_no.trim() ||
-    !["Monthly", "Weekly", "Day-wise"].includes(fee_plan) ||
-    !join_date ||
-    !isValidDate(join_date)
-  ) {
-    return sendErrorResponse(
-      res,
-      400,
-      "Please provide valid hosteller and room details.",
-    );
-  }
+    // Validate Day-wise number of days
+    if (
+        fee_plan === "Day-wise" &&
+        (
+            !Number.isInteger(number_of_days) ||
+            number_of_days < 1 ||
+            number_of_days > 365
+        )
+    ) {
+        return sendErrorResponse(
+            res,
+            400,
+            "For Day-wise fee plan, number_of_days must be between 1 and 365."
+        );
+    }
 
-  const client = await pool.connect();
-  let transactionStarted = false;
+    // Monthly plan should not have number_of_days
+    if (
+        fee_plan === "Monthly" &&
+        number_of_days != null
+    ) {
+        return sendErrorResponse(
+            res,
+            400,
+            "number_of_days is only allowed for Day-wise fee plan."
+        );
+    }
 
-  try {
-    await client.query("BEGIN");
-    transactionStarted = true;
+    // Validate request body
+    if (
+        typeof full_name !== "string" ||
+        !full_name.trim() ||
+        typeof aadhar_number !== "string" ||
+        !/^\d{12}$/.test(aadhar_number) ||
+        typeof phone_number !== "string" ||
+        !/^\d{10}$/.test(phone_number) ||
+        (address != null && typeof address !== "string") ||
+        (
+            emergency_contact_number != null &&
+            emergency_contact_number !== "" &&
+            (
+                typeof emergency_contact_number !== "string" ||
+                !/^\d{10}$/.test(emergency_contact_number)
+            )
+        ) ||
+        !Number.isInteger(Number(building_id)) ||
+        Number(building_id) <= 0 ||
+        typeof floor !== "string" ||
+        !floor.trim() ||
+        typeof room_no !== "string" ||
+        !room_no.trim() ||
+        !["Monthly", "Day-wise"].includes(fee_plan) ||
+        !join_date ||
+        !isValidDate(join_date)
+    ) {
+        return sendErrorResponse(
+            res,
+            400,
+            "Please provide valid hosteller and room details."
+        );
+    }
 
-    // Find and lock selected room
-    const roomResult = await client.query(
-      `SELECT
+    const client = await pool.connect();
+    let transactionStarted = false;
+
+    try {
+        await client.query("BEGIN");
+        transactionStarted = true;
+
+        // Find and lock selected room
+        const roomResult = await client.query(
+            `SELECT
                 r.room_id,
                 r.building_id,
                 r.floor,
@@ -323,43 +357,33 @@ export const createHosteller = async (req, res) => {
                AND r.status = 'ACTIVE'
                AND b.status = 'ACTIVE'
              FOR UPDATE OF r`,
-      [Number(building_id), floor.trim(), room_no.trim()],
-    );
+            [Number(building_id), floor.trim(), room_no.trim()]
+        );
 
-    if (roomResult.rowCount === 0) {
-      await client.query("ROLLBACK");
-      transactionStarted = false;
+        if (roomResult.rowCount === 0) {
+            fail(404, "Selected room not found or inactive.");
+        }
 
-      return sendErrorResponse(
-        res,
-        404,
-        "Selected room not found or inactive.",
-      );
-    }
+        const room = roomResult.rows[0];
 
-    const room = roomResult.rows[0];
-
-    // Check room availability
-    const occupiedResult = await client.query(
-      `SELECT COUNT(*)::INTEGER AS occupied_beds
+        // Check room availability
+        const occupiedResult = await client.query(
+            `SELECT COUNT(*)::INTEGER AS occupied_beds
              FROM tbl_room_allocations
              WHERE room_id = $1
                AND status = 'ACTIVE'`,
-      [room.room_id],
-    );
+            [room.room_id]
+        );
 
-    const occupiedBeds = occupiedResult.rows[0].occupied_beds;
+        const occupiedBeds = occupiedResult.rows[0].occupied_beds;
 
-    if (occupiedBeds >= room.sharing_type) {
-      await client.query("ROLLBACK");
-      transactionStarted = false;
+        if (occupiedBeds >= room.sharing_type) {
+            fail(409, "Selected room is already full.");
+        }
 
-      return sendErrorResponse(res, 409, "Selected room is already full.");
-    }
-
-    // Register hosteller
-    const hostellerResult = await client.query(
-      `INSERT INTO tbl_hostellers (
+        // Register hosteller
+        const hostellerResult = await client.query(
+            `INSERT INTO tbl_hostellers (
                 full_name,
                 aadhar_number,
                 phone_number,
@@ -370,24 +394,25 @@ export const createHosteller = async (req, res) => {
                 number_of_days,
                 status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, 'Staying')
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'Staying')
             RETURNING *`,
-      [
-        full_name.trim(),
-        aadhar_number,
-        phone_number,
-        address?.trim() || null,
-        emergency_contact_number || null,
-        join_date,
-        fee_plan,
-      ],
-    );
+            [
+                full_name.trim(),
+                aadhar_number,
+                phone_number,
+                address?.trim() || null,
+                emergency_contact_number || null,
+                join_date,
+                fee_plan,
+                fee_plan === "Day-wise" ? number_of_days : null
+            ]
+        );
 
-    const hosteller = hostellerResult.rows[0];
+        const hosteller = hostellerResult.rows[0];
 
-    // Allocate room
-    const allocationResult = await client.query(
-      `INSERT INTO tbl_room_allocations (
+        // Allocate room
+        const allocationResult = await client.query(
+            `INSERT INTO tbl_room_allocations (
                 room_id,
                 hosteller_id,
                 allocation_date,
@@ -395,66 +420,76 @@ export const createHosteller = async (req, res) => {
             )
             VALUES ($1, $2, $3, 'ACTIVE')
             RETURNING *`,
-      [room.room_id, hosteller.hosteller_id, join_date],
-    );
+            [room.room_id, hosteller.hosteller_id, join_date]
+        );
 
-    // Update filled beds
-    await client.query(
-      `UPDATE tbl_rooms
+        // Update filled beds
+        await client.query(
+            `UPDATE tbl_rooms
              SET beds_filled = $1,
                  updated_at = CURRENT_TIMESTAMP
              WHERE room_id = $2`,
-      [occupiedBeds + 1, room.room_id],
-    );
+            [occupiedBeds + 1, room.room_id]
+        );
 
-    await client.query("COMMIT");
-    transactionStarted = false;
+        await client.query("COMMIT");
+        transactionStarted = false;
 
-    return sendSuccessResponse(
-      res,
-      201,
-      "Hosteller registered and room allocated successfully",
-      {
-        hosteller,
-        allocation: allocationResult.rows[0],
-        room: {
-          building_id: room.building_id,
-          building_name: room.building_name,
-          floor: room.floor,
-          room_no: room.room_number,
-          sharing_type: room.sharing_type,
-          monthly_cost: room.monthly_cost,
-          beds_filled: occupiedBeds + 1,
-          available_beds: room.sharing_type - (occupiedBeds + 1),
-        },
-      },
-    );
-  } catch (error) {
-    if (transactionStarted) {
-      await client.query("ROLLBACK");
+        return sendSuccessResponse(
+            res,
+            201,
+            "Hosteller registered and room allocated successfully",
+            {
+                hosteller,
+                allocation: allocationResult.rows[0],
+                room: {
+                    building_id: room.building_id,
+                    building_name: room.building_name,
+                    floor: room.floor,
+                    room_no: room.room_number,
+                    sharing_type: room.sharing_type,
+                    monthly_cost: room.monthly_cost,
+                    beds_filled: occupiedBeds + 1,
+                    available_beds: room.sharing_type - (occupiedBeds + 1)
+                }
+            }
+        );
+
+    } catch (error) {
+        if (transactionStarted) {
+            await client.query("ROLLBACK");
+        }
+
+        if (error.code === "23505") {
+            return sendErrorResponse(
+                res,
+                409,
+                "Hosteller with this Aadhar number already exists."
+            );
+        }
+
+        if (error.code === "23503") {
+            return sendErrorResponse(
+                res,
+                400,
+                "Invalid building or room reference."
+            );
+        }
+
+        console.error("Create hosteller error:", error);
+
+        return sendErrorResponse(
+            res,
+            error.status || 500,
+            error.status ? error.message : "Internal server error"
+        );
+
+    } finally {
+        client.release();
     }
-
-    if (error.code === "23505") {
-      return sendErrorResponse(
-        res,
-        409,
-        "Hosteller with this Aadhar number already exists.",
-      );
-    }
-
-    if (error.code === "23503") {
-      return sendErrorResponse(res, 400, "Invalid building or room reference.");
-    }
-
-    console.error("Create hosteller error:", error);
-
-    return sendErrorResponse(res, 500, "Internal server error");
-  } finally {
-    client.release();
-  }
 };
 
-// GET all/hostellers
+// GET /hostellers
 export async function getAllHostellers(req, res) {
     const client = await pool.connect();
 
@@ -466,6 +501,7 @@ export async function getAllHostellers(req, res) {
 
         const { status, search } = req.query;
 
+        // Validate status
         if (
             status &&
             !HOSTELLER_STATUSES.includes(status)
@@ -479,13 +515,16 @@ export async function getAllHostellers(req, res) {
         const values = [];
         const conditions = [];
 
+        // Status filter
         if (status) {
             values.push(status);
+
             conditions.push(
                 `h.status = $${values.length}`
             );
         }
 
+        // Search filter
         if (search && String(search).trim()) {
             values.push(`%${String(search).trim()}%`);
 
@@ -505,6 +544,7 @@ export async function getAllHostellers(req, res) {
             ? `WHERE ${conditions.join(" AND ")}`
             : "";
 
+        // Fetch hostellers
         const result = await client.query(
             `SELECT
                 h.hosteller_id,
@@ -546,8 +586,9 @@ export async function getAllHostellers(req, res) {
                     status
                 FROM tbl_room_allocations
                 WHERE hosteller_id = h.hosteller_id
-                ORDER BY allocation_date DESC,
-                         allocation_id DESC
+                ORDER BY
+                    allocation_date DESC,
+                    allocation_id DESC
                 LIMIT 1
             ) ra ON TRUE
 
@@ -565,12 +606,8 @@ export async function getAllHostellers(req, res) {
 
         await client.query("COMMIT");
 
-        const hostellers = result.rows.map((row) => ({
-            ...row,
-            aadhar_number: row.aadhar_number
-                ? `XXXX-XXXX-${row.aadhar_number.slice(-4)}`
-                : null
-        }));
+        // Return complete Aadhar number without masking
+        const hostellers = result.rows;
 
         return sendSuccessResponse(
             res,
@@ -600,6 +637,7 @@ export async function getAllHostellers(req, res) {
 // GET /hostellers/:hostellerId
 export async function getHostellerById(req, res) {
     const hostellerId = getHostellerId(req, res);
+
     if (!hostellerId) return;
 
     const client = await pool.connect();
@@ -607,6 +645,7 @@ export async function getHostellerById(req, res) {
     try {
         await client.query("BEGIN");
 
+        // Automatically update due vacating hostellers
         await finalizeDueVacatings(client);
 
         const result = await client.query(
@@ -632,8 +671,9 @@ export async function getHostellerById(req, res) {
                  SELECT *
                  FROM tbl_room_allocations
                  WHERE hosteller_id = h.hosteller_id
-                 ORDER BY allocation_date DESC,
-                          allocation_id DESC
+                 ORDER BY
+                     allocation_date DESC,
+                     allocation_id DESC
                  LIMIT 1
              ) ra ON TRUE
 
@@ -659,11 +699,8 @@ export async function getHostellerById(req, res) {
 
         await client.query("COMMIT");
 
+        // Return complete Aadhar number without masking
         const hosteller = result.rows[0];
-
-        hosteller.aadhar_number = hosteller.aadhar_number
-            ? `XXXX-XXXX-${hosteller.aadhar_number.slice(-4)}`
-            : null;
 
         return sendSuccessResponse(
             res,
