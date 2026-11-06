@@ -256,6 +256,8 @@ export const createHosteller = async (req, res) => {
         full_name,
         aadhar_number,
         phone_number,
+        address,
+        emergency_contact_number,
         building_id,
         floor,
         room_no,
@@ -274,6 +276,17 @@ export const createHosteller = async (req, res) => {
         typeof phone_number !== "string" ||
         !/^\d{10}$/.test(phone_number) ||
 
+        (address != null && typeof address !== "string") ||
+
+        (
+            emergency_contact_number != null &&
+            emergency_contact_number !== "" &&
+            (
+                typeof emergency_contact_number !== "string" ||
+                !/^\d{10}$/.test(emergency_contact_number)
+            )
+        ) ||
+
         !Number.isInteger(Number(building_id)) ||
         Number(building_id) <= 0 ||
 
@@ -286,7 +299,7 @@ export const createHosteller = async (req, res) => {
         !["Monthly", "Weekly", "Day-wise"].includes(fee_plan) ||
 
         !join_date ||
-        isNaN(Date.parse(join_date))
+        !isValidDate(join_date)
     ) {
         return sendErrorResponse(
             res,
@@ -370,17 +383,21 @@ export const createHosteller = async (req, res) => {
                 full_name,
                 aadhar_number,
                 phone_number,
+                address,
+                emergency_contact_number,
                 join_date,
                 fee_plan,
                 number_of_days,
                 status
             )
-            VALUES ($1, $2, $3, $4, $5, NULL, 'Staying')
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, 'Staying')
             RETURNING *`,
             [
                 full_name.trim(),
                 aadhar_number,
                 phone_number,
+                address?.trim() || null,
+                emergency_contact_number || null,
                 join_date,
                 fee_plan
             ]
