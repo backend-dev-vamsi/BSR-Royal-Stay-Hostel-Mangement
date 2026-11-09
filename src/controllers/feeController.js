@@ -40,89 +40,138 @@ function getPeriodEnd(fromDate, months) {
 
 
 
+// POST /fees/collect
 export async function collectFee(req, res) {
-    const {
-        hosteller_id,
-        fee_type,
-        number_of_months,
-        from_date,
-        amount,
-        payment_date,
-        payment_mode,
-        reference_note
-    } = req.body;
-
-    // Validate hosteller ID
-    if (!Number.isInteger(Number(hosteller_id)) || Number(hosteller_id) <= 0) {
-        return sendErrorResponse(res, 400, "Valid hosteller_id is required");
-    }
-
-    // Validate fee type
-    if (!["Monthly", "Weekly", "Day-wise"].includes(fee_type)) {
-        return sendErrorResponse(res, 400, "Invalid fee_type");
-    }
-
-    // Validate dates
-    if (!from_date || !payment_date) {
-        return sendErrorResponse(
-            res,
-            400,
-            "from_date and payment_date are required"
-        );
-    }
-
-    // Validate payment mode
-    if (!PAYMENT_MODES.includes(payment_mode)) {
-        return sendErrorResponse(res, 400, "Invalid payment_mode");
-    }
-
-    // Validate number of months
-    if (
-        fee_type === "Monthly" &&
-        (
-            !Number.isInteger(Number(number_of_months)) ||
-            Number(number_of_months) < 1 ||
-            Number(number_of_months) > 120
-        )
-    ) {
-        return sendErrorResponse(
-            res,
-            400,
-            "number_of_months must be between 1 and 120"
-        );
-    }
-
-    if (fee_type !== "Monthly" && number_of_months != null) {
-        return sendErrorResponse(
-            res,
-            400,
-            "number_of_months is only applicable to Monthly fees"
-        );
-    }
-
-    // Validate amount
-    const paidAmount = Number(amount);
-
-    if (!Number.isFinite(paidAmount) || paidAmount <= 0) {
-        return sendErrorResponse(
-            res,
-            400,
-            "amount must be greater than zero"
-        );
-    }
-
-    const client = await pool.connect();
-    let transactionStarted = false;
+    let client;
 
     try {
-        await client.query("BEGIN");
-        transactionStarted = true;
+        const {
+            hosteller_id,
+            fee_type,
+            rate,
+            number_of_days,
+            from_date,
+            amount,
+            payment_date,
+            payment_mode,
+            reference_note
+        } = req.body;
 
-        // Lock hosteller row to prevent simultaneous payments
+        // -----------------------------
+        // 1. Basic validation
+        // -----------------------------
+
+        const hostellerId = Number(hosteller_id);
+        const paidAmount = Number(amount);
+
+        if (!Number.isInteger(hostellerId) || hostellerId <= 0) {
+            return sendErrorResponse(res, 400, "Invalid hosteller ID");
+        }
+
+        if (!["Monthly", "Day-wise"].includes(fee_type)) {
+            return sendErrorResponse(res, 400, "Invalid fee type");
+        }
+
+        if (!from_date || !payment_date) {
+            return sendErrorResponse(
+                res,
+                400,
+                "From date and payment date are required"
+            );
+        }
+
+        const isValidDate = (value) => {
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+
+            const date = new Date(`${value}T00:00:00.000Z`);
+
+            return (
+                !Number.isNaN(date.getTime()) &&
+                date.toISOString().slice(0, 10) === value
+            );
+        };
+
+        if (!isValidDate(from_date)) {
+            return sendErrorResponse(res, 400, "Invalid from date");
+        }
+
+        if (!isValidDate(payment_date)) {
+            return sendErrorResponse(res, 400, "Invalid payment date");
+        }
+
+        if (payment_date < from_date) {
+            return sendErrorResponse(
+                res,
+                400,
+                "Payment date cannot be before the fee start date"
+            );
+        }
+
+        if (!Number.isFinite(paidAmount) || paidAmount <= 0) {
+            return sendErrorResponse(
+                res,
+                400,
+                "Payment amount must be greater than zero"
+            );
+        }
+
+        if (!/^\d+(\.\d{1,2})?$/.test(String(amount))) {
+            return sendErrorResponse(
+                res,
+                400,
+                "Payment amount can have a maximum of 2 decimal places"
+            );
+        }
+
+        const PAYMENT_MODES = [
+            "Cash",
+            "UPI",
+            "Bank Transfer",
+            "Card",
+            "Cheque"
+        ];
+
+        if (!PAYMENT_MODES.includes(payment_mode)) {
+            return sendErrorResponse(res, 400, "Invalid payment mode");
+        }
+
+        // -----------------------------
+        // 2. Date calculation
+        // -----------------------------
+
+        const addDays = (dateString, days) => {
+            const date = new Date(`${dateString}T00:00:00.000Z`);
+            date.setUTCDate(date.getUTCDate() + days);
+
+            return date.toISOString().slice(0, 10);
+        };
+
+        const getMonthlyPeriodEnd = (dateString) => {
+            const date = new Date(`${dateString}T00:00:00.000Z`);
+
+            date.setUTCMonth(date.getUTCMonth() + 1);
+
+            date.setUTCDate(date.getUTCDate() - 1);
+
+            return date.toISOString().slice(0, 10);
+        };
+
+        // -----------------------------
+        // 3. Start transaction
+        // -----------------------------
+
+        client = await pool.connect();
+
+        await client.query("BEGIN");
+
+        // Lock hosteller to prevent concurrent fee collection
         const hostellerResult = await client.query(
             `SELECT
                 h.hosteller_id,
+                h.full_name,
                 h.status AS hosteller_status,
+                h.fee_plan,
+                r.room_id,
                 r.monthly_cost
              FROM tbl_hostellers h
              LEFT JOIN tbl_room_allocations a
@@ -132,13 +181,11 @@ export async function collectFee(req, res) {
                 ON r.room_id = a.room_id
              WHERE h.hosteller_id = $1
              FOR UPDATE OF h`,
-            [hosteller_id]
+            [hostellerId]
         );
 
-        if (!hostellerResult.rowCount) {
+        if (hostellerResult.rowCount === 0) {
             await client.query("ROLLBACK");
-            transactionStarted = false;
-
             return sendErrorResponse(res, 404, "Hosteller not found");
         }
 
@@ -146,173 +193,240 @@ export async function collectFee(req, res) {
 
         if (hosteller.hosteller_status !== "Staying") {
             await client.query("ROLLBACK");
-            transactionStarted = false;
-
             return sendErrorResponse(
                 res,
-                409,
-                "Fees cannot be collected for a vacated hosteller"
+                400,
+                "Fee can only be collected from staying hostellers"
             );
         }
 
-        if (hosteller.monthly_cost == null) {
+        if (!hosteller.room_id) {
             await client.query("ROLLBACK");
-            transactionStarted = false;
+            return sendErrorResponse(
+                res,
+                400,
+                "Hosteller does not have an active room allocation"
+            );
+        }
+
+        if (hosteller.fee_plan !== fee_type) {
+            await client.query("ROLLBACK");
+            return sendErrorResponse(
+                res,
+                400,
+                `Hosteller fee plan is ${hosteller.fee_plan}. Please select the correct fee type`
+            );
+        }
+
+        // -----------------------------
+        // 4. Calculate fee
+        // -----------------------------
+
+        let applicableRate;
+        let numberOfDays = null;
+        let periodEnd;
+        let feeAmount;
+
+        if (fee_type === "Monthly") {
+            // Monthly rate comes from room monthly cost
+            applicableRate = Number(hosteller.monthly_cost);
+
+            if (
+                !Number.isFinite(applicableRate) ||
+                applicableRate <= 0
+            ) {
+                await client.query("ROLLBACK");
+                return sendErrorResponse(
+                    res,
+                    400,
+                    "Invalid monthly room cost"
+                );
+            }
+
+            periodEnd = getMonthlyPeriodEnd(from_date);
+
+            // One month per collection
+            feeAmount = applicableRate;
+        }
+
+        if (fee_type === "Day-wise") {
+            // Admin manually enters rate and number of days
+            applicableRate = Number(rate);
+            numberOfDays = Number(number_of_days);
+
+            if (
+                !Number.isFinite(applicableRate) ||
+                applicableRate <= 0 ||
+                !/^\d+(\.\d{1,2})?$/.test(String(rate))
+            ) {
+                await client.query("ROLLBACK");
+                return sendErrorResponse(
+                    res,
+                    400,
+                    "Please enter a valid daily rate"
+                );
+            }
+
+            if (
+                !Number.isInteger(numberOfDays) ||
+                numberOfDays < 1 ||
+                numberOfDays > 365
+            ) {
+                await client.query("ROLLBACK");
+                return sendErrorResponse(
+                    res,
+                    400,
+                    "Number of days must be between 1 and 365"
+                );
+            }
+
+            periodEnd = addDays(from_date, numberOfDays - 1);
+
+            feeAmount = Number(
+                (applicableRate * numberOfDays).toFixed(2)
+            );
+        }
+
+        // -----------------------------
+        // 5. Check existing fee periods
+        // -----------------------------
+
+        const existingFeesResult = await client.query(
+            `SELECT
+                hf.fee_id,
+                hf.fee_type,
+                hf.rate,
+                hf.number_of_days,
+                hf.fee_period_start,
+                hf.fee_period_end,
+                hf.fee_amount,
+                COALESCE(
+                    SUM(fp.amount_paid),
+                    0
+                ) AS total_paid
+             FROM tbl_hostel_fees hf
+             LEFT JOIN tbl_fee_payments fp
+                ON fp.fee_id = hf.fee_id
+             WHERE hf.hosteller_id = $1
+                AND hf.fee_type = $2
+                AND hf.fee_period_start <= $4::date
+                AND hf.fee_period_end >= $3::date
+             GROUP BY hf.fee_id
+             FOR UPDATE OF hf`,
+            [
+                hostellerId,
+                fee_type,
+                from_date,
+                periodEnd
+            ]
+        );
+
+        let existingFee = null;
+
+        for (const fee of existingFeesResult.rows) {
+            const samePeriod =
+                String(fee.fee_period_start).slice(0, 10) === from_date &&
+                String(fee.fee_period_end).slice(0, 10) === periodEnd;
+
+            const sameRate =
+                Number(fee.rate) === applicableRate;
+
+            const sameAmount =
+                Number(fee.fee_amount) === feeAmount;
+
+            const sameDays =
+                fee_type === "Monthly" ||
+                Number(fee.number_of_days) === numberOfDays;
+
+            if (
+                samePeriod &&
+                sameRate &&
+                sameAmount &&
+                sameDays
+            ) {
+                existingFee = fee;
+            } else {
+                await client.query("ROLLBACK");
+
+                return sendErrorResponse(
+                    res,
+                    409,
+                    "A fee already exists for an overlapping period with different fee details"
+                );
+            }
+        }
+
+        // -----------------------------
+        // 6. Calculate remaining balance
+        // -----------------------------
+
+        const previouslyPaid = existingFee
+            ? Number(existingFee.total_paid)
+            : 0;
+
+        const balance = Number(
+            (feeAmount - previouslyPaid).toFixed(2)
+        );
+
+        if (balance <= 0) {
+            await client.query("ROLLBACK");
 
             return sendErrorResponse(
                 res,
                 400,
-                "Hosteller does not have an active room with a monthly cost"
+                "This fee period is already fully paid"
             );
         }
 
-        const monthlyCost = Number(hosteller.monthly_cost);
+        if (paidAmount > balance) {
+            await client.query("ROLLBACK");
 
-        const months = fee_type === "Monthly"
-            ? Number(number_of_months)
-            : null;
-
-        // Calculate fee period
-        const periodEnd = fee_type === "Monthly"
-            ? getPeriodEnd(from_date, months)
-            : from_date;
-
-        let feeAmount;
-        let balance;
-
-        if (fee_type === "Monthly") {
-            // Monthly fee = room monthly cost × number of months
-            feeAmount = Number(
-                (monthlyCost * months).toFixed(2)
+            return sendErrorResponse(
+                res,
+                400,
+                `Payment amount cannot exceed the remaining balance of ${balance}`
             );
+        }
 
-            // Get existing payments for the requested fee period
-            const existingPaymentResult = await client.query(
-                `SELECT
-                    COALESCE(SUM(fp.amount_paid), 0) AS total_paid
-                 FROM tbl_fee_payments fp
-                 INNER JOIN tbl_hostel_fees hf
-                    ON hf.fee_id = fp.fee_id
-                 WHERE hf.hosteller_id = $1
-                   AND hf.fee_type = 'Monthly'
-                   AND hf.fee_period_start < ($3::date + INTERVAL '1 day')
-                   AND hf.fee_period_end >= $2::date`,
-                [hosteller_id, from_date, periodEnd]
-            );
+        // -----------------------------
+        // 7. Create or reuse fee record
+        // -----------------------------
 
-            const alreadyPaid = Number(
-                existingPaymentResult.rows[0].total_paid
-            );
+        let fee;
 
-            const remainingBalance = Math.max(
-                Number((feeAmount - alreadyPaid).toFixed(2)),
-                0
-            );
-
-            if (remainingBalance <= 0) {
-                await client.query("ROLLBACK");
-                transactionStarted = false;
-
-                return sendErrorResponse(
-                    res,
-                    409,
-                    "Hosteller has already paid for this month"
-                );
-            }
-
-            if (paidAmount > remainingBalance) {
-                await client.query("ROLLBACK");
-                transactionStarted = false;
-
-                return sendErrorResponse(
-                    res,
-                    400,
-                    `Payment exceeds the remaining balance of ${remainingBalance}`
-                );
-            }
-
-            balance = Number(
-                (remainingBalance - paidAmount).toFixed(2)
-            );
-
+        if (existingFee) {
+            fee = existingFee;
         } else {
-            // Weekly and Day-wise fee calculation
-            feeAmount = monthlyCost;
-
-            const existingPaymentResult = await client.query(
-                `SELECT
-                    COALESCE(SUM(fp.amount_paid), 0) AS total_paid
-                 FROM tbl_fee_payments fp
-                 INNER JOIN tbl_hostel_fees hf
-                    ON hf.fee_id = fp.fee_id
-                 WHERE hf.hosteller_id = $1
-                   AND hf.fee_type = $2
-                   AND hf.fee_period_start = $3::date
-                   AND hf.fee_period_end = $4::date`,
-                [hosteller_id, fee_type, from_date, periodEnd]
+            const feeResult = await client.query(
+                `INSERT INTO tbl_hostel_fees (
+                    hosteller_id,
+                    fee_type,
+                    number_of_days,
+                    rate,
+                    fee_period_start,
+                    fee_period_end,
+                    fee_amount
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING *`,
+                [
+                    hostellerId,
+                    fee_type,
+                    numberOfDays,
+                    applicableRate,
+                    from_date,
+                    periodEnd,
+                    feeAmount
+                ]
             );
 
-            const alreadyPaid = Number(
-                existingPaymentResult.rows[0].total_paid
-            );
-
-            const remainingBalance = Math.max(
-                Number((feeAmount - alreadyPaid).toFixed(2)),
-                0
-            );
-
-            if (remainingBalance <= 0) {
-                await client.query("ROLLBACK");
-                transactionStarted = false;
-
-                return sendErrorResponse(
-                    res,
-                    409,
-                    "Hosteller has already paid for this fee period"
-                );
-            }
-
-            if (paidAmount > remainingBalance) {
-                await client.query("ROLLBACK");
-                transactionStarted = false;
-
-                return sendErrorResponse(
-                    res,
-                    400,
-                    `Payment exceeds the remaining balance of ${remainingBalance}`
-                );
-            }
-
-            balance = Number(
-                (remainingBalance - paidAmount).toFixed(2)
-            );
+            fee = feeResult.rows[0];
         }
 
-        // Insert fee record
-        const feeResult = await client.query(
-            `INSERT INTO tbl_hostel_fees (
-                hosteller_id,
-                fee_type,
-                number_of_months,
-                fee_period_start,
-                fee_period_end,
-                fee_amount
-             )
-             VALUES ($1, $2, $3, $4, $5, $6)
-             RETURNING *`,
-            [
-                hosteller_id,
-                fee_type,
-                months,
-                from_date,
-                periodEnd,
-                feeAmount
-            ]
-        );
+        // -----------------------------
+        // 8. Insert payment
+        // -----------------------------
 
-        const fee = feeResult.rows[0];
-
-        // Insert payment record
         const paymentResult = await client.query(
             `INSERT INTO tbl_fee_payments (
                 fee_id,
@@ -320,33 +434,44 @@ export async function collectFee(req, res) {
                 payment_date,
                 payment_mode,
                 reference_note
-             )
-             VALUES ($1, $2, $3, $4, $5)
-             RETURNING *`,
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING *`,
             [
                 fee.fee_id,
                 paidAmount,
                 payment_date,
                 payment_mode,
-                reference_note?.trim() || null
+                reference_note || null
             ]
         );
 
         const payment = paymentResult.rows[0];
 
-        const feeStatus = balance === 0
-            ? "PAID"
-            : "PARTIAL";
+        // -----------------------------
+        // 9. Calculate final balance
+        // -----------------------------
 
-        await client.query(
-            `UPDATE tbl_hostel_fees
-             SET updated_at = CURRENT_TIMESTAMP
-             WHERE fee_id = $1`,
-            [fee.fee_id]
+        const totalPaid = Number(
+            (previouslyPaid + paidAmount).toFixed(2)
         );
 
+        const remainingBalance = Number(
+            (feeAmount - totalPaid).toFixed(2)
+        );
+
+        const feeStatus =
+            remainingBalance === 0
+                ? "Paid"
+                : totalPaid > 0
+                    ? "Partially Paid"
+                    : "Pending";
+
+        // -----------------------------
+        // 10. Commit transaction
+        // -----------------------------
+
         await client.query("COMMIT");
-        transactionStarted = false;
 
         return sendSuccessResponse(
             res,
@@ -355,27 +480,43 @@ export async function collectFee(req, res) {
             {
                 fee,
                 payment,
-                total_amount: feeAmount,
-                amount_paid: paidAmount,
-                balance,
-                status: feeStatus
+                fee_calculation: {
+                    hosteller_id: hostellerId,
+                    hosteller_name: hosteller.full_name,
+                    fee_type,
+                    rate: applicableRate,
+                    number_of_days: numberOfDays,
+                    fee_period_start: from_date,
+                    fee_period_end: periodEnd,
+                    total_fee: feeAmount,
+                    previously_paid: previouslyPaid,
+                    amount_paid: paidAmount,
+                    total_paid: totalPaid,
+                    balance: remainingBalance,
+                    status: feeStatus
+                }
             }
         );
 
     } catch (error) {
-        if (transactionStarted) {
-            await client.query("ROLLBACK");
+        if (client) {
+            await client.query("ROLLBACK").catch(() => {});
         }
 
         console.error("Collect fee error:", error);
 
         return sendErrorResponse(
             res,
-            500,
-            "Failed to collect fee"
+            error.status || 500,
+            error.status
+                ? error.message
+                : "Unable to collect fee"
         );
+
     } finally {
-        client.release();
+        if (client) {
+            client.release();
+        }
     }
 }
 
