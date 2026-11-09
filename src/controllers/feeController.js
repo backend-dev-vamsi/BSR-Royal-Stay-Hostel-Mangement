@@ -37,6 +37,9 @@ function getPeriodEnd(fromDate, months) {
     return date.toISOString().slice(0, 10);
 }
 
+
+
+
 export async function collectFee(req, res) {
     const {
         hosteller_id,
@@ -44,50 +47,78 @@ export async function collectFee(req, res) {
         number_of_months,
         from_date,
         amount,
-        amount_paid,
         payment_date,
         payment_mode,
         reference_note
     } = req.body;
 
+    // Validate hosteller ID
     if (!Number.isInteger(Number(hosteller_id)) || Number(hosteller_id) <= 0) {
         return sendErrorResponse(res, 400, "Valid hosteller_id is required");
     }
 
+    // Validate fee type
     if (!["Monthly", "Weekly", "Day-wise"].includes(fee_type)) {
         return sendErrorResponse(res, 400, "Invalid fee_type");
     }
 
+    // Validate dates
     if (!from_date || !payment_date) {
         return sendErrorResponse(
-            res, 400, "from_date and payment_date are required"
+            res,
+            400,
+            "from_date and payment_date are required"
         );
     }
 
+    // Validate payment mode
     if (!PAYMENT_MODES.includes(payment_mode)) {
         return sendErrorResponse(res, 400, "Invalid payment_mode");
     }
 
-    if (fee_type === "Monthly" &&
-        (!Number.isInteger(Number(number_of_months)) ||
-         Number(number_of_months) < 1 ||
-         Number(number_of_months) > 120)) {
+    // Validate number of months
+    if (
+        fee_type === "Monthly" &&
+        (
+            !Number.isInteger(Number(number_of_months)) ||
+            Number(number_of_months) < 1 ||
+            Number(number_of_months) > 120
+        )
+    ) {
         return sendErrorResponse(
-            res, 400, "number_of_months must be between 1 and 120"
+            res,
+            400,
+            "number_of_months must be between 1 and 120"
         );
     }
 
     if (fee_type !== "Monthly" && number_of_months != null) {
         return sendErrorResponse(
-            res, 400, "number_of_months is only applicable to Monthly fees"
+            res,
+            400,
+            "number_of_months is only applicable to Monthly fees"
+        );
+    }
+
+    // Validate amount
+    const paidAmount = Number(amount);
+
+    if (!Number.isFinite(paidAmount) || paidAmount <= 0) {
+        return sendErrorResponse(
+            res,
+            400,
+            "amount must be greater than zero"
         );
     }
 
     const client = await pool.connect();
+    let transactionStarted = false;
 
     try {
         await client.query("BEGIN");
+        transactionStarted = true;
 
+        // Lock hosteller row to prevent simultaneous payments
         const hostellerResult = await client.query(
             `SELECT
                 h.hosteller_id,
@@ -106,6 +137,8 @@ export async function collectFee(req, res) {
 
         if (!hostellerResult.rowCount) {
             await client.query("ROLLBACK");
+            transactionStarted = false;
+
             return sendErrorResponse(res, 404, "Hosteller not found");
         }
 
@@ -113,50 +146,149 @@ export async function collectFee(req, res) {
 
         if (hosteller.hosteller_status !== "Staying") {
             await client.query("ROLLBACK");
+            transactionStarted = false;
+
             return sendErrorResponse(
-                res, 409, "Fees cannot be collected for a vacated hosteller"
+                res,
+                409,
+                "Fees cannot be collected for a vacated hosteller"
             );
         }
 
         if (hosteller.monthly_cost == null) {
             await client.query("ROLLBACK");
+            transactionStarted = false;
+
             return sendErrorResponse(
-                res, 400, "Hosteller does not have an active room with a monthly cost"
+                res,
+                400,
+                "Hosteller does not have an active room with a monthly cost"
             );
         }
+
+        const monthlyCost = Number(hosteller.monthly_cost);
 
         const months = fee_type === "Monthly"
             ? Number(number_of_months)
             : null;
 
-        // Amount is editable by the admin.
-        const feeAmount = amount == null
-            ? Number(hosteller.monthly_cost) *
-                (fee_type === "Monthly" ? months : 1)
-            : Number(amount);
-
-        const paidAmount = amount_paid == null
-            ? feeAmount
-            : Number(amount_paid);
-
-        if (!Number.isFinite(feeAmount) || feeAmount <= 0) {
-            await client.query("ROLLBACK");
-            return sendErrorResponse(res, 400, "amount must be greater than zero");
-        }
-
-        if (!Number.isFinite(paidAmount) ||
-            paidAmount <= 0 ||
-            paidAmount > feeAmount) {
-            await client.query("ROLLBACK");
-            return sendErrorResponse(
-                res, 400, "amount_paid must be positive and cannot exceed amount"
-            );
-        }
-
+        // Calculate fee period
         const periodEnd = fee_type === "Monthly"
             ? getPeriodEnd(from_date, months)
             : from_date;
 
+        let feeAmount;
+        let balance;
+
+        if (fee_type === "Monthly") {
+            // Monthly fee = room monthly cost × number of months
+            feeAmount = Number(
+                (monthlyCost * months).toFixed(2)
+            );
+
+            // Get existing payments for the requested fee period
+            const existingPaymentResult = await client.query(
+                `SELECT
+                    COALESCE(SUM(fp.amount_paid), 0) AS total_paid
+                 FROM tbl_fee_payments fp
+                 INNER JOIN tbl_hostel_fees hf
+                    ON hf.fee_id = fp.fee_id
+                 WHERE hf.hosteller_id = $1
+                   AND hf.fee_type = 'Monthly'
+                   AND hf.fee_period_start < ($3::date + INTERVAL '1 day')
+                   AND hf.fee_period_end >= $2::date`,
+                [hosteller_id, from_date, periodEnd]
+            );
+
+            const alreadyPaid = Number(
+                existingPaymentResult.rows[0].total_paid
+            );
+
+            const remainingBalance = Math.max(
+                Number((feeAmount - alreadyPaid).toFixed(2)),
+                0
+            );
+
+            if (remainingBalance <= 0) {
+                await client.query("ROLLBACK");
+                transactionStarted = false;
+
+                return sendErrorResponse(
+                    res,
+                    409,
+                    "Hosteller has already paid for this month"
+                );
+            }
+
+            if (paidAmount > remainingBalance) {
+                await client.query("ROLLBACK");
+                transactionStarted = false;
+
+                return sendErrorResponse(
+                    res,
+                    400,
+                    `Payment exceeds the remaining balance of ${remainingBalance}`
+                );
+            }
+
+            balance = Number(
+                (remainingBalance - paidAmount).toFixed(2)
+            );
+
+        } else {
+            // Weekly and Day-wise fee calculation
+            feeAmount = monthlyCost;
+
+            const existingPaymentResult = await client.query(
+                `SELECT
+                    COALESCE(SUM(fp.amount_paid), 0) AS total_paid
+                 FROM tbl_fee_payments fp
+                 INNER JOIN tbl_hostel_fees hf
+                    ON hf.fee_id = fp.fee_id
+                 WHERE hf.hosteller_id = $1
+                   AND hf.fee_type = $2
+                   AND hf.fee_period_start = $3::date
+                   AND hf.fee_period_end = $4::date`,
+                [hosteller_id, fee_type, from_date, periodEnd]
+            );
+
+            const alreadyPaid = Number(
+                existingPaymentResult.rows[0].total_paid
+            );
+
+            const remainingBalance = Math.max(
+                Number((feeAmount - alreadyPaid).toFixed(2)),
+                0
+            );
+
+            if (remainingBalance <= 0) {
+                await client.query("ROLLBACK");
+                transactionStarted = false;
+
+                return sendErrorResponse(
+                    res,
+                    409,
+                    "Hosteller has already paid for this fee period"
+                );
+            }
+
+            if (paidAmount > remainingBalance) {
+                await client.query("ROLLBACK");
+                transactionStarted = false;
+
+                return sendErrorResponse(
+                    res,
+                    400,
+                    `Payment exceeds the remaining balance of ${remainingBalance}`
+                );
+            }
+
+            balance = Number(
+                (remainingBalance - paidAmount).toFixed(2)
+            );
+        }
+
+        // Insert fee record
         const feeResult = await client.query(
             `INSERT INTO tbl_hostel_fees (
                 hosteller_id,
@@ -180,6 +312,7 @@ export async function collectFee(req, res) {
 
         const fee = feeResult.rows[0];
 
+        // Insert payment record
         const paymentResult = await client.query(
             `INSERT INTO tbl_fee_payments (
                 fee_id,
@@ -200,9 +333,6 @@ export async function collectFee(req, res) {
         );
 
         const payment = paymentResult.rows[0];
-        const balance = Number(
-            (feeAmount - paidAmount).toFixed(2)
-        );
 
         const feeStatus = balance === 0
             ? "PAID"
@@ -216,20 +346,34 @@ export async function collectFee(req, res) {
         );
 
         await client.query("COMMIT");
+        transactionStarted = false;
 
-        return sendSuccessResponse(res, 201, "Fee collected successfully", {
-            fee,
-            payment,
-            total_amount: feeAmount,
-            amount_paid: paidAmount,
-            balance,
-            status: feeStatus
-        });
+        return sendSuccessResponse(
+            res,
+            201,
+            "Fee collected successfully",
+            {
+                fee,
+                payment,
+                total_amount: feeAmount,
+                amount_paid: paidAmount,
+                balance,
+                status: feeStatus
+            }
+        );
+
     } catch (error) {
-        await client.query("ROLLBACK");
+        if (transactionStarted) {
+            await client.query("ROLLBACK");
+        }
+
         console.error("Collect fee error:", error);
 
-        return sendErrorResponse(res, 500, "Failed to collect fee");
+        return sendErrorResponse(
+            res,
+            500,
+            "Failed to collect fee"
+        );
     } finally {
         client.release();
     }
@@ -242,11 +386,11 @@ export async function getFeeSummary(req, res) {
             req.query.month || new Date().toISOString().slice(0, 7);
 
         if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
-            return res.status(400).json({
-                success: false,
-                data: null,
-                message: "Invalid month. Use YYYY-MM format."
-            });
+            return sendErrorResponse(
+                res,
+                400,
+                "Invalid month. Use YYYY-MM format."
+            );
         }
 
         const query = `
@@ -255,42 +399,32 @@ export async function getFeeSummary(req, res) {
                     $1::date AS month_start,
                     ($1::date + INTERVAL '1 month')::date AS next_month
             ),
-            hosteller_fees AS (
+
+            hosteller_details AS (
                 SELECT
                     h.hosteller_id,
                     h.full_name,
                     h.phone_number,
-                    h.status AS hosteller_status,
+                    h.fee_plan,
 
-                    CASE
-                        WHEN b.building_name IS NULL THEN NULL
-                        ELSE CONCAT(
-                            b.building_name,
-                            ' – Floor ',
-                            CASE
-                                WHEN r.floor::text = '1' THEN '1st'
-                                WHEN r.floor::text = '2' THEN '2nd'
-                                WHEN r.floor::text = '3' THEN '3rd'
-                                ELSE r.floor::text 
-                            END,
-                            ' – Room ',
-                            r.room_number
-                        )
-                    END AS room,
+                    b.building_name,
+                    r.floor,
+                    r.room_number,
+                    r.sharing_type,
 
-                    r.sharing_type AS sharing,
+                    COALESCE(r.monthly_cost, 0)::NUMERIC AS rate,
 
-                    COALESCE(f.fee_plan, 'Monthly') AS fee_plan,
-                    COALESCE(f.fee_amount, 0) AS rate,
-                    COALESCE(p.paid_amount, 0) AS paid
+                    COALESCE(payment.total_paid, 0)::NUMERIC AS total_paid,
+
+                    last_payment.payment_date
 
                 FROM tbl_hostellers h
 
                 LEFT JOIN LATERAL (
-                    SELECT a.room_id
+                    SELECT
+                        a.room_id
                     FROM tbl_room_allocations a
                     WHERE a.hosteller_id = h.hosteller_id
-                      AND a.status = 'ACTIVE'
                     ORDER BY
                         a.allocation_date DESC,
                         a.allocation_id DESC
@@ -305,47 +439,52 @@ export async function getFeeSummary(req, res) {
 
                 CROSS JOIN selected_month sm
 
+                -- Total payments made during the selected month
                 LEFT JOIN LATERAL (
                     SELECT
-                        hf.fee_type AS fee_plan,
-                        SUM(hf.fee_amount) AS fee_amount
-                    FROM tbl_hostel_fees hf
-                    WHERE hf.hosteller_id = h.hosteller_id
-                      AND hf.fee_period_start < sm.next_month
-                      AND hf.fee_period_end >= sm.month_start
-                    GROUP BY hf.fee_type
-                    ORDER BY hf.fee_type
-                    LIMIT 1
-                ) f ON TRUE
-
-                LEFT JOIN LATERAL (
-                    SELECT SUM(fp.amount_paid) AS paid_amount
+                        SUM(fp.amount_paid) AS total_paid
                     FROM tbl_fee_payments fp
-                    JOIN tbl_hostel_fees hf
+                    INNER JOIN tbl_hostel_fees hf
                         ON hf.fee_id = fp.fee_id
                     WHERE hf.hosteller_id = h.hosteller_id
                       AND fp.payment_date >= sm.month_start
                       AND fp.payment_date < sm.next_month
-                ) p ON TRUE
+                ) payment ON TRUE
+
+                -- Latest payment date across all months
+                LEFT JOIN LATERAL (
+                    SELECT
+                        MAX(fp.payment_date)::DATE AS payment_date
+                    FROM tbl_fee_payments fp
+                    INNER JOIN tbl_hostel_fees hf
+                        ON hf.fee_id = fp.fee_id
+                    WHERE hf.hosteller_id = h.hosteller_id
+                ) last_payment ON TRUE
 
                 WHERE h.status = 'Staying'
+            ),
+
+            calculated_fees AS (
+                SELECT
+                    *,
+                    LEAST(total_paid, rate) AS paid,
+                    GREATEST(
+                        rate - LEAST(total_paid, rate),
+                        0
+                    ) AS balance
+                FROM hosteller_details
             )
+
             SELECT
-                COALESCE(SUM(rate), 0) AS "monthlyPlanTotal",
-
+                COALESCE(SUM(rate), 0) AS monthly_plan_total,
                 COALESCE(SUM(paid), 0) AS collected,
-
-                GREATEST(
-                    COALESCE(SUM(rate), 0)
-                    - COALESCE(SUM(paid), 0),
-                    0
-                ) AS pending,
+                COALESCE(SUM(balance), 0) AS pending,
 
                 COUNT(*) FILTER (
-                    WHERE rate > 0 AND paid >= rate
-                ) AS "fullyPaid",
+                    WHERE rate > 0 AND balance = 0
+                ) AS fully_paid,
 
-                COUNT(*) AS "totalHostellers",
+                COUNT(*) AS total_hostellers,
 
                 COALESCE(
                     JSON_AGG(
@@ -353,55 +492,63 @@ export async function getFeeSummary(req, res) {
                             'hosteller_id', hosteller_id,
                             'hosteller', full_name,
                             'phone', phone_number,
-                            'room', room,
-                            'sharing', sharing,
+                            'building', building_name,
+                            'floor', floor,
+                            'room_no', room_number,
+                            'sharing', sharing_type,
                             'fee_plan', fee_plan,
                             'rate', rate,
                             'paid', paid,
-                            'balance', GREATEST(rate - paid, 0),
+                            'balance', balance,
+
                             'status',
                                 CASE
-                                    WHEN rate <= 0 THEN 'Pending'
-                                    WHEN paid >= rate THEN 'Paid'
-                                    WHEN paid > 0 THEN 'Partial'
+                                    WHEN balance = 0 AND rate > 0
+                                        THEN 'Paid'
+                                    WHEN paid > 0
+                                        THEN 'Partial'
                                     ELSE 'Pending'
                                 END,
-                            'action', hosteller_id
+
+                            'payment_date', payment_date
                         )
                         ORDER BY full_name
                     ),
-                    '[]'::json
+                    '[]'::JSON
                 ) AS hostellers
 
-            FROM hosteller_fees;
+            FROM calculated_fees;
         `;
 
         const result = await pool.query(query, [`${month}-01`]);
+
         const row = result.rows[0];
 
-        return res.status(200).json({
-            success: true,
-            data: {
+        return sendSuccessResponse(
+            res,
+            200,
+            "Fee summary fetched successfully",
+            {
                 month,
                 summary: {
-                    monthlyPlanTotal: Number(row.monthlyPlanTotal),
+                    monthlyPlanTotal: Number(row.monthly_plan_total),
                     collected: Number(row.collected),
                     pending: Number(row.pending),
-                    fullyPaid: Number(row.fullyPaid),
-                    totalHostellers: Number(row.totalHostellers)
+                    fullyPaid: Number(row.fully_paid),
+                    totalHostellers: Number(row.total_hostellers)
                 },
                 hostellers: row.hostellers
-            },
-            message: "Fee summary fetched successfully"
-        });
+            }
+        );
+
     } catch (error) {
         console.error("Get fee summary error:", error);
 
-        return res.status(500).json({
-            success: false,
-            data: null,
-            message: "Failed to fetch fee summary"
-        });
+        return sendErrorResponse(
+            res,
+            500,
+            "Failed to fetch fee summary"
+        );
     }
 }
 
