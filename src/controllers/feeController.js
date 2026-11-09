@@ -39,7 +39,6 @@ function getPeriodEnd(fromDate, months) {
 
 
 
-
 // POST /fees/collect
 export async function collectFee(req, res) {
     let client;
@@ -49,7 +48,6 @@ export async function collectFee(req, res) {
             hosteller_id,
             fee_type,
             rate,
-            number_of_days,
             from_date,
             amount,
             payment_date,
@@ -63,6 +61,9 @@ export async function collectFee(req, res) {
 
         const hostellerId = Number(hosteller_id);
         const paidAmount = Number(amount);
+
+        const isValidAmount = (value) =>
+            /^(?:\d+)(?:\.\d{1,2})?$/.test(String(value));
 
         if (!Number.isInteger(hostellerId) || hostellerId <= 0) {
             return sendErrorResponse(res, 400, "Invalid hosteller ID");
@@ -112,19 +113,15 @@ export async function collectFee(req, res) {
             );
         }
 
-        if (!Number.isFinite(paidAmount) || paidAmount <= 0) {
+        if (
+            !Number.isFinite(paidAmount) ||
+            paidAmount <= 0 ||
+            !isValidAmount(amount)
+        ) {
             return sendErrorResponse(
                 res,
                 400,
-                "Payment amount must be greater than zero"
-            );
-        }
-
-        if (!/^\d+(\.\d{1,2})?$/.test(String(amount))) {
-            return sendErrorResponse(
-                res,
-                400,
-                "Payment amount can have a maximum of 2 decimal places"
+                "Enter a valid payment amount with a maximum of 2 decimal places"
             );
         }
 
@@ -141,7 +138,7 @@ export async function collectFee(req, res) {
         }
 
         // -----------------------------
-        // 2. Date calculation
+        // 2. Date calculation helpers
         // -----------------------------
 
         const addDays = (dateString, days) => {
@@ -185,12 +182,15 @@ export async function collectFee(req, res) {
 
         await client.query("BEGIN");
 
+        // Lock hosteller to prevent concurrent fee collection.
+
         const hostellerResult = await client.query(
             `SELECT
                 h.hosteller_id,
                 h.full_name,
                 h.status AS hosteller_status,
                 h.fee_plan,
+                h.number_of_days,
                 r.room_id,
                 r.monthly_cost
              FROM tbl_hostellers h
@@ -207,11 +207,7 @@ export async function collectFee(req, res) {
         if (hostellerResult.rowCount === 0) {
             await client.query("ROLLBACK");
 
-            return sendErrorResponse(
-                res,
-                404,
-                "Hosteller not found"
-            );
+            return sendErrorResponse(res, 404, "Hosteller not found");
         }
 
         const hosteller = hostellerResult.rows[0];
@@ -256,7 +252,8 @@ export async function collectFee(req, res) {
         let feeAmount;
 
         if (fee_type === "Monthly") {
-            // Monthly calculation remains unchanged.
+            // Monthly rate comes from room monthly cost.
+
             applicableRate = Number(hosteller.monthly_cost);
 
             if (
@@ -274,28 +271,19 @@ export async function collectFee(req, res) {
 
             periodEnd = getMonthlyPeriodEnd(from_date);
 
-            // One month per collection
+            // One calendar month per fee record.
+
             feeAmount = Number(applicableRate.toFixed(2));
         }
 
         if (fee_type === "Day-wise") {
-            // Admin enters rate per day and number of days.
+            // Number of days comes from tbl_hostellers.
+
+            numberOfDays = Number(hosteller.number_of_days);
+
+            // Admin manually enters the daily rate.
+
             applicableRate = Number(rate);
-            numberOfDays = Number(number_of_days);
-
-            if (
-                !Number.isFinite(applicableRate) ||
-                applicableRate <= 0 ||
-                !/^\d+(\.\d{1,2})?$/.test(String(rate))
-            ) {
-                await client.query("ROLLBACK");
-
-                return sendErrorResponse(
-                    res,
-                    400,
-                    "Please enter a valid daily rate"
-                );
-            }
 
             if (
                 !Number.isInteger(numberOfDays) ||
@@ -307,21 +295,40 @@ export async function collectFee(req, res) {
                 return sendErrorResponse(
                     res,
                     400,
-                    "Number of days must be between 1 and 365"
+                    "Hosteller number of days must be between 1 and 365"
+                );
+            }
+
+            if (
+                !Number.isFinite(applicableRate) ||
+                applicableRate <= 0 ||
+                !isValidAmount(rate)
+            ) {
+                await client.query("ROLLBACK");
+
+                return sendErrorResponse(
+                    res,
+                    400,
+                    "Please enter a valid daily rate with a maximum of 2 decimal places"
                 );
             }
 
             periodEnd = addDays(from_date, numberOfDays - 1);
 
-            // Total fee = rate per day * number of days
+            // Total fee = daily rate × hosteller number of days.
+
             feeAmount = Number(
                 (applicableRate * numberOfDays).toFixed(2)
             );
         }
 
         // -----------------------------
-        // 5. Check existing fee periods
+        // 5. Check existing fee period
         // -----------------------------
+
+        // Monthly: match start and end dates.
+        // Day-wise: match start date only.
+        // Existing fee details remain unchanged for partial payments.
 
         const existingFeesResult = await client.query(
             `SELECT
@@ -348,7 +355,10 @@ export async function collectFee(req, res) {
              WHERE hf.hosteller_id = $1
                 AND hf.fee_type = $2
                 AND hf.fee_period_start = $3::date
-                AND hf.fee_period_end = $4::date
+                AND (
+                    $2 <> 'Monthly'
+                    OR hf.fee_period_end = $4::date
+                )
              ORDER BY hf.fee_id DESC
              LIMIT 1
              FOR UPDATE OF hf`,
@@ -360,8 +370,7 @@ export async function collectFee(req, res) {
             ]
         );
 
-        const existingFee =
-            existingFeesResult.rows[0] || null;
+        const existingFee = existingFeesResult.rows[0] || null;
 
         // -----------------------------
         // 6. Calculate remaining balance
@@ -371,8 +380,8 @@ export async function collectFee(req, res) {
             ? Number(existingFee.total_paid)
             : 0;
 
-        // If fee already exists, retain its original fee amount.
-        // This is important for partial payments.
+        // Use saved fee details for an existing period.
+
         const finalFeeAmount = existingFee
             ? Number(existingFee.fee_amount)
             : feeAmount;
@@ -384,6 +393,14 @@ export async function collectFee(req, res) {
         const finalNumberOfDays = existingFee
             ? existingFee.number_of_days
             : numberOfDays;
+
+        const finalPeriodStart = existingFee
+            ? existingFee.fee_period_start
+            : from_date;
+
+        const finalPeriodEnd = existingFee
+            ? existingFee.fee_period_end
+            : periodEnd;
 
         const balance = Number(
             (finalFeeAmount - previouslyPaid).toFixed(2)
@@ -416,8 +433,12 @@ export async function collectFee(req, res) {
         let fee;
 
         if (existingFee) {
+            // Reuse existing fee record for partial payments.
+
             fee = existingFee;
         } else {
+            // Create a new record for a new fee period.
+
             const feeResult = await client.query(
                 `INSERT INTO tbl_hostel_fees (
                     hosteller_id,
@@ -507,8 +528,8 @@ export async function collectFee(req, res) {
                     fee_type,
                     rate: finalRate,
                     number_of_days: finalNumberOfDays,
-                    fee_period_start: from_date,
-                    fee_period_end: periodEnd,
+                    fee_period_start: finalPeriodStart,
+                    fee_period_end: finalPeriodEnd,
                     total_fee: finalFeeAmount,
                     previously_paid: previouslyPaid,
                     amount_paid: paidAmount,
@@ -577,7 +598,6 @@ export async function getFeeSummary(req, res) {
                     COALESCE(r.monthly_cost, 0)::NUMERIC
                         AS monthly_cost,
 
-                    -- Fee details for the selected fee month
                     COALESCE(fee_summary.total_fee, 0)::NUMERIC
                         AS recorded_total_fee,
 
@@ -587,7 +607,7 @@ export async function getFeeSummary(req, res) {
                     COALESCE(fee_summary.number_of_days, 0)::INTEGER
                         AS number_of_days,
 
-                    fee_summary.day_wise_rate,
+                    fee_summary.latest_rate,
 
                     fee_summary.payment_date
 
@@ -613,7 +633,6 @@ export async function getFeeSummary(req, res) {
 
                 CROSS JOIN selected_month sm
 
-                -- Selected month's fee records and their payments
                 LEFT JOIN LATERAL (
                     SELECT
                         SUM(hf.fee_amount) AS total_fee,
@@ -627,7 +646,7 @@ export async function getFeeSummary(req, res) {
                                 hf.rate
                                 ORDER BY hf.fee_id DESC
                             )
-                        )[1] AS day_wise_rate,
+                        )[1] AS latest_rate,
 
                         SUM(
                             COALESCE(payment.total_paid, 0)
@@ -661,19 +680,14 @@ export async function getFeeSummary(req, res) {
                 SELECT
                     *,
 
-                    -- Monthly rate comes from room monthly cost.
-                    -- Day-wise rate comes from the fee record.
                     CASE
+                        WHEN latest_rate IS NOT NULL
+                            THEN latest_rate
                         WHEN fee_plan = 'Monthly'
                             THEN monthly_cost
-                        WHEN fee_plan = 'Day-wise'
-                            THEN COALESCE(day_wise_rate, 0)
                         ELSE 0
                     END::NUMERIC AS rate,
 
-                    -- Monthly: use recorded fee if available,
-                    -- otherwise use room monthly cost.
-                    -- Day-wise: use recorded fee only.
                     CASE
                         WHEN fee_plan = 'Monthly'
                             THEN
@@ -696,7 +710,7 @@ export async function getFeeSummary(req, res) {
                 SELECT
                     *,
 
-                    LEAST(total_paid, total_fee) AS paid,
+                    total_paid AS paid,
 
                     GREATEST(
                         total_fee - total_paid,
@@ -734,8 +748,8 @@ export async function getFeeSummary(req, res) {
                             'room_no', room_number,
                             'sharing', sharing_type,
                             'fee_plan', fee_plan,
-
                             'rate', rate,
+
                             'number_of_days',
                                 CASE
                                     WHEN fee_plan = 'Day-wise'
@@ -798,6 +812,7 @@ export async function getFeeSummary(req, res) {
         );
     }
 }
+
 
 export async function getPaymentHistory(req, res) {
     try {
