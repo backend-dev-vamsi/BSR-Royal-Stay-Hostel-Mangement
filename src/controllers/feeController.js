@@ -81,7 +81,12 @@ export async function collectFee(req, res) {
         }
 
         const isValidDate = (value) => {
-            if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+            if (
+                typeof value !== "string" ||
+                !/^\d{4}-\d{2}-\d{2}$/.test(value)
+            ) {
+                return false;
+            }
 
             const date = new Date(`${value}T00:00:00.000Z`);
 
@@ -141,6 +146,7 @@ export async function collectFee(req, res) {
 
         const addDays = (dateString, days) => {
             const date = new Date(`${dateString}T00:00:00.000Z`);
+
             date.setUTCDate(date.getUTCDate() + days);
 
             return date.toISOString().slice(0, 10);
@@ -149,7 +155,22 @@ export async function collectFee(req, res) {
         const getMonthlyPeriodEnd = (dateString) => {
             const date = new Date(`${dateString}T00:00:00.000Z`);
 
+            const originalDay = date.getUTCDate();
+
+            date.setUTCDate(1);
             date.setUTCMonth(date.getUTCMonth() + 1);
+
+            const lastDayOfTargetMonth = new Date(
+                Date.UTC(
+                    date.getUTCFullYear(),
+                    date.getUTCMonth() + 1,
+                    0
+                )
+            ).getUTCDate();
+
+            date.setUTCDate(
+                Math.min(originalDay, lastDayOfTargetMonth)
+            );
 
             date.setUTCDate(date.getUTCDate() - 1);
 
@@ -164,7 +185,6 @@ export async function collectFee(req, res) {
 
         await client.query("BEGIN");
 
-        // Lock hosteller to prevent concurrent fee collection
         const hostellerResult = await client.query(
             `SELECT
                 h.hosteller_id,
@@ -186,13 +206,19 @@ export async function collectFee(req, res) {
 
         if (hostellerResult.rowCount === 0) {
             await client.query("ROLLBACK");
-            return sendErrorResponse(res, 404, "Hosteller not found");
+
+            return sendErrorResponse(
+                res,
+                404,
+                "Hosteller not found"
+            );
         }
 
         const hosteller = hostellerResult.rows[0];
 
         if (hosteller.hosteller_status !== "Staying") {
             await client.query("ROLLBACK");
+
             return sendErrorResponse(
                 res,
                 400,
@@ -202,6 +228,7 @@ export async function collectFee(req, res) {
 
         if (!hosteller.room_id) {
             await client.query("ROLLBACK");
+
             return sendErrorResponse(
                 res,
                 400,
@@ -211,6 +238,7 @@ export async function collectFee(req, res) {
 
         if (hosteller.fee_plan !== fee_type) {
             await client.query("ROLLBACK");
+
             return sendErrorResponse(
                 res,
                 400,
@@ -228,7 +256,7 @@ export async function collectFee(req, res) {
         let feeAmount;
 
         if (fee_type === "Monthly") {
-            // Monthly rate comes from room monthly cost
+            // Monthly calculation remains unchanged.
             applicableRate = Number(hosteller.monthly_cost);
 
             if (
@@ -236,6 +264,7 @@ export async function collectFee(req, res) {
                 applicableRate <= 0
             ) {
                 await client.query("ROLLBACK");
+
                 return sendErrorResponse(
                     res,
                     400,
@@ -246,11 +275,11 @@ export async function collectFee(req, res) {
             periodEnd = getMonthlyPeriodEnd(from_date);
 
             // One month per collection
-            feeAmount = applicableRate;
+            feeAmount = Number(applicableRate.toFixed(2));
         }
 
         if (fee_type === "Day-wise") {
-            // Admin manually enters rate and number of days
+            // Admin enters rate per day and number of days.
             applicableRate = Number(rate);
             numberOfDays = Number(number_of_days);
 
@@ -260,6 +289,7 @@ export async function collectFee(req, res) {
                 !/^\d+(\.\d{1,2})?$/.test(String(rate))
             ) {
                 await client.query("ROLLBACK");
+
                 return sendErrorResponse(
                     res,
                     400,
@@ -273,6 +303,7 @@ export async function collectFee(req, res) {
                 numberOfDays > 365
             ) {
                 await client.query("ROLLBACK");
+
                 return sendErrorResponse(
                     res,
                     400,
@@ -282,6 +313,7 @@ export async function collectFee(req, res) {
 
             periodEnd = addDays(from_date, numberOfDays - 1);
 
+            // Total fee = rate per day * number of days
             feeAmount = Number(
                 (applicableRate * numberOfDays).toFixed(2)
             );
@@ -301,17 +333,24 @@ export async function collectFee(req, res) {
                 hf.fee_period_end,
                 hf.fee_amount,
                 COALESCE(
-                    SUM(fp.amount_paid),
+                    payment_summary.total_paid,
                     0
                 ) AS total_paid
              FROM tbl_hostel_fees hf
-             LEFT JOIN tbl_fee_payments fp
-                ON fp.fee_id = hf.fee_id
+             LEFT JOIN (
+                SELECT
+                    fee_id,
+                    SUM(amount_paid) AS total_paid
+                FROM tbl_fee_payments
+                GROUP BY fee_id
+             ) payment_summary
+                ON payment_summary.fee_id = hf.fee_id
              WHERE hf.hosteller_id = $1
                 AND hf.fee_type = $2
-                AND hf.fee_period_start <= $4::date
-                AND hf.fee_period_end >= $3::date
-             GROUP BY hf.fee_id
+                AND hf.fee_period_start = $3::date
+                AND hf.fee_period_end = $4::date
+             ORDER BY hf.fee_id DESC
+             LIMIT 1
              FOR UPDATE OF hf`,
             [
                 hostellerId,
@@ -321,40 +360,8 @@ export async function collectFee(req, res) {
             ]
         );
 
-        let existingFee = null;
-
-        for (const fee of existingFeesResult.rows) {
-            const samePeriod =
-                String(fee.fee_period_start).slice(0, 10) === from_date &&
-                String(fee.fee_period_end).slice(0, 10) === periodEnd;
-
-            const sameRate =
-                Number(fee.rate) === applicableRate;
-
-            const sameAmount =
-                Number(fee.fee_amount) === feeAmount;
-
-            const sameDays =
-                fee_type === "Monthly" ||
-                Number(fee.number_of_days) === numberOfDays;
-
-            if (
-                samePeriod &&
-                sameRate &&
-                sameAmount &&
-                sameDays
-            ) {
-                existingFee = fee;
-            } else {
-                await client.query("ROLLBACK");
-
-                return sendErrorResponse(
-                    res,
-                    409,
-                    "A fee already exists for an overlapping period with different fee details"
-                );
-            }
-        }
+        const existingFee =
+            existingFeesResult.rows[0] || null;
 
         // -----------------------------
         // 6. Calculate remaining balance
@@ -364,8 +371,22 @@ export async function collectFee(req, res) {
             ? Number(existingFee.total_paid)
             : 0;
 
+        // If fee already exists, retain its original fee amount.
+        // This is important for partial payments.
+        const finalFeeAmount = existingFee
+            ? Number(existingFee.fee_amount)
+            : feeAmount;
+
+        const finalRate = existingFee
+            ? Number(existingFee.rate)
+            : applicableRate;
+
+        const finalNumberOfDays = existingFee
+            ? existingFee.number_of_days
+            : numberOfDays;
+
         const balance = Number(
-            (feeAmount - previouslyPaid).toFixed(2)
+            (finalFeeAmount - previouslyPaid).toFixed(2)
         );
 
         if (balance <= 0) {
@@ -374,7 +395,7 @@ export async function collectFee(req, res) {
             return sendErrorResponse(
                 res,
                 400,
-                "This fee period is already fully paid"
+                "This fee is already fully paid"
             );
         }
 
@@ -457,7 +478,7 @@ export async function collectFee(req, res) {
         );
 
         const remainingBalance = Number(
-            (feeAmount - totalPaid).toFixed(2)
+            (finalFeeAmount - totalPaid).toFixed(2)
         );
 
         const feeStatus =
@@ -484,11 +505,11 @@ export async function collectFee(req, res) {
                     hosteller_id: hostellerId,
                     hosteller_name: hosteller.full_name,
                     fee_type,
-                    rate: applicableRate,
-                    number_of_days: numberOfDays,
+                    rate: finalRate,
+                    number_of_days: finalNumberOfDays,
                     fee_period_start: from_date,
                     fee_period_end: periodEnd,
-                    total_fee: feeAmount,
+                    total_fee: finalFeeAmount,
                     previously_paid: previouslyPaid,
                     amount_paid: paidAmount,
                     total_paid: totalPaid,
@@ -553,11 +574,22 @@ export async function getFeeSummary(req, res) {
                     r.room_number,
                     r.sharing_type,
 
-                    COALESCE(r.monthly_cost, 0)::NUMERIC AS rate,
+                    COALESCE(r.monthly_cost, 0)::NUMERIC
+                        AS monthly_cost,
 
-                    COALESCE(payment.total_paid, 0)::NUMERIC AS total_paid,
+                    -- Fee details for the selected fee month
+                    COALESCE(fee_summary.total_fee, 0)::NUMERIC
+                        AS recorded_total_fee,
 
-                    last_payment.payment_date
+                    COALESCE(fee_summary.total_paid, 0)::NUMERIC
+                        AS total_paid,
+
+                    COALESCE(fee_summary.number_of_days, 0)::INTEGER
+                        AS number_of_days,
+
+                    fee_summary.day_wise_rate,
+
+                    fee_summary.payment_date
 
                 FROM tbl_hostellers h
 
@@ -566,6 +598,7 @@ export async function getFeeSummary(req, res) {
                         a.room_id
                     FROM tbl_room_allocations a
                     WHERE a.hosteller_id = h.hosteller_id
+                      AND a.status = 'ACTIVE'
                     ORDER BY
                         a.allocation_date DESC,
                         a.allocation_id DESC
@@ -580,27 +613,46 @@ export async function getFeeSummary(req, res) {
 
                 CROSS JOIN selected_month sm
 
-                -- Total payments made during the selected month
+                -- Selected month's fee records and their payments
                 LEFT JOIN LATERAL (
                     SELECT
-                        SUM(fp.amount_paid) AS total_paid
-                    FROM tbl_fee_payments fp
-                    INNER JOIN tbl_hostel_fees hf
-                        ON hf.fee_id = fp.fee_id
-                    WHERE hf.hosteller_id = h.hosteller_id
-                      AND fp.payment_date >= sm.month_start
-                      AND fp.payment_date < sm.next_month
-                ) payment ON TRUE
+                        SUM(hf.fee_amount) AS total_fee,
 
-                -- Latest payment date across all months
-                LEFT JOIN LATERAL (
-                    SELECT
-                        MAX(fp.payment_date)::DATE AS payment_date
-                    FROM tbl_fee_payments fp
-                    INNER JOIN tbl_hostel_fees hf
-                        ON hf.fee_id = fp.fee_id
+                        SUM(
+                            COALESCE(hf.number_of_days, 0)
+                        ) AS number_of_days,
+
+                        (
+                            ARRAY_AGG(
+                                hf.rate
+                                ORDER BY hf.fee_id DESC
+                            )
+                        )[1] AS day_wise_rate,
+
+                        SUM(
+                            COALESCE(payment.total_paid, 0)
+                        ) AS total_paid,
+
+                        MAX(
+                            payment.last_payment_date
+                        ) AS payment_date
+
+                    FROM tbl_hostel_fees hf
+
+                    LEFT JOIN LATERAL (
+                        SELECT
+                            SUM(fp.amount_paid) AS total_paid,
+                            MAX(fp.payment_date)::DATE
+                                AS last_payment_date
+                        FROM tbl_fee_payments fp
+                        WHERE fp.fee_id = hf.fee_id
+                    ) payment ON TRUE
+
                     WHERE hf.hosteller_id = h.hosteller_id
-                ) last_payment ON TRUE
+                      AND hf.fee_period_start >= sm.month_start
+                      AND hf.fee_period_start < sm.next_month
+
+                ) fee_summary ON TRUE
 
                 WHERE h.status = 'Staying'
             ),
@@ -608,21 +660,65 @@ export async function getFeeSummary(req, res) {
             calculated_fees AS (
                 SELECT
                     *,
-                    LEAST(total_paid, rate) AS paid,
+
+                    -- Monthly rate comes from room monthly cost.
+                    -- Day-wise rate comes from the fee record.
+                    CASE
+                        WHEN fee_plan = 'Monthly'
+                            THEN monthly_cost
+                        WHEN fee_plan = 'Day-wise'
+                            THEN COALESCE(day_wise_rate, 0)
+                        ELSE 0
+                    END::NUMERIC AS rate,
+
+                    -- Monthly: use recorded fee if available,
+                    -- otherwise use room monthly cost.
+                    -- Day-wise: use recorded fee only.
+                    CASE
+                        WHEN fee_plan = 'Monthly'
+                            THEN
+                                CASE
+                                    WHEN recorded_total_fee > 0
+                                        THEN recorded_total_fee
+                                    ELSE monthly_cost
+                                END
+
+                        WHEN fee_plan = 'Day-wise'
+                            THEN recorded_total_fee
+
+                        ELSE 0
+                    END::NUMERIC AS total_fee
+
+                FROM hosteller_details
+            ),
+
+            final_fees AS (
+                SELECT
+                    *,
+
+                    LEAST(total_paid, total_fee) AS paid,
+
                     GREATEST(
-                        rate - LEAST(total_paid, rate),
+                        total_fee - total_paid,
                         0
                     ) AS balance
-                FROM hosteller_details
+
+                FROM calculated_fees
             )
 
             SELECT
-                COALESCE(SUM(rate), 0) AS monthly_plan_total,
-                COALESCE(SUM(paid), 0) AS collected,
-                COALESCE(SUM(balance), 0) AS pending,
+                COALESCE(SUM(total_fee), 0)
+                    AS monthly_plan_total,
+
+                COALESCE(SUM(paid), 0)
+                    AS collected,
+
+                COALESCE(SUM(balance), 0)
+                    AS pending,
 
                 COUNT(*) FILTER (
-                    WHERE rate > 0 AND balance = 0
+                    WHERE total_fee > 0
+                      AND balance = 0
                 ) AS fully_paid,
 
                 COUNT(*) AS total_hostellers,
@@ -638,13 +734,23 @@ export async function getFeeSummary(req, res) {
                             'room_no', room_number,
                             'sharing', sharing_type,
                             'fee_plan', fee_plan,
+
                             'rate', rate,
+                            'number_of_days',
+                                CASE
+                                    WHEN fee_plan = 'Day-wise'
+                                        THEN number_of_days
+                                    ELSE NULL
+                                END,
+
+                            'total_fee', total_fee,
                             'paid', paid,
                             'balance', balance,
 
                             'status',
                                 CASE
-                                    WHEN balance = 0 AND rate > 0
+                                    WHEN total_fee > 0
+                                         AND balance = 0
                                         THEN 'Paid'
                                     WHEN paid > 0
                                         THEN 'Partial'
@@ -658,7 +764,7 @@ export async function getFeeSummary(req, res) {
                     '[]'::JSON
                 ) AS hostellers
 
-            FROM calculated_fees;
+            FROM final_fees;
         `;
 
         const result = await pool.query(query, [`${month}-01`]);
@@ -692,7 +798,6 @@ export async function getFeeSummary(req, res) {
         );
     }
 }
-
 
 export async function getPaymentHistory(req, res) {
     try {
