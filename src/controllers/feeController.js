@@ -820,11 +820,17 @@ export async function getPaymentHistory(req, res) {
             req.query.month || new Date().toISOString().slice(0, 7);
 
         const search = (req.query.search || "").trim();
-        const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+
+        const page = Math.max(
+            parseInt(req.query.page, 10) || 1,
+            1
+        );
+
         const limit = Math.min(
             Math.max(parseInt(req.query.limit, 10) || 20, 1),
             100
         );
+
         const offset = (page - 1) * limit;
 
         if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
@@ -841,7 +847,9 @@ export async function getPaymentHistory(req, res) {
                     'RC' || LPAD(fp.payment_id::text, 4, '0')
                         AS payment_id,
 
-                    fp.payment_date AS paid_on,
+                    TO_CHAR(fp.payment_date, 'DD-MM-YYYY')
+                        AS paid_on,
+
                     h.full_name AS hosteller,
 
                     CASE
@@ -859,9 +867,9 @@ export async function getPaymentHistory(req, res) {
                         ELSE hf.fee_type
                     END AS fee_type,
 
-                    TO_CHAR(hf.fee_period_start, 'YYYY-MM-DD')
+                    TO_CHAR(hf.fee_period_start, 'DD-MM-YYYY')
                         || ' → ' ||
-                    TO_CHAR(hf.fee_period_end, 'YYYY-MM-DD')
+                    TO_CHAR(hf.fee_period_end, 'DD-MM-YYYY')
                         AS period,
 
                     fp.amount_paid AS amount,
@@ -891,6 +899,7 @@ export async function getPaymentHistory(req, res) {
                       ) ILIKE '%' || $2 || '%'
                   )
             )
+
             SELECT
                 *,
                 COUNT(*) OVER() AS total_records
@@ -935,6 +944,7 @@ export async function getPaymentHistory(req, res) {
                 }
             }
         });
+
     } catch (error) {
         console.error("Get payment history error:", error);
 
