@@ -923,6 +923,8 @@ export async function getPaymentHistory(req, res) {
 
         return res.status(200).json({
             success: true,
+            statuscode: 200,
+            message: "Payment history fetched successfully",
             data: {
                 payments,
                 pagination: {
@@ -931,8 +933,7 @@ export async function getPaymentHistory(req, res) {
                     totalRecords,
                     totalPages: Math.ceil(totalRecords / limit)
                 }
-            },
-            message: "Payment history fetched successfully"
+            }
         });
     } catch (error) {
         console.error("Get payment history error:", error);
