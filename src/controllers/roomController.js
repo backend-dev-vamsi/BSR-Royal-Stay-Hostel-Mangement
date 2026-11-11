@@ -645,7 +645,10 @@ export const updateRoom = async (req, res) => {
 };
 
 
+
 export const deleteRoom = async (req, res) => {
+    const client = await pool.connect();
+
     try {
         const { roomId } = req.params;
 
@@ -657,14 +660,18 @@ export const deleteRoom = async (req, res) => {
             );
         }
 
-        const room = await pool.query(
-            `SELECT room_id
+        await client.query("BEGIN");
+
+        const room = await client.query(
+            `SELECT room_id, building_id
              FROM tbl_rooms
-             WHERE room_id = $1`,
+             WHERE room_id = $1
+             FOR UPDATE`,
             [Number(roomId)]
         );
 
         if (room.rowCount === 0) {
+            await client.query("ROLLBACK");
             return sendErrorResponse(
                 res,
                 404,
@@ -672,7 +679,10 @@ export const deleteRoom = async (req, res) => {
             );
         }
 
-        const occupancy = await pool.query(
+        const buildingId = room.rows[0].building_id;
+
+        // Check for active hostellers.
+        const occupancy = await client.query(
             `SELECT COUNT(*)::INTEGER AS filled
              FROM tbl_room_allocations
              WHERE room_id = $1
@@ -681,6 +691,7 @@ export const deleteRoom = async (req, res) => {
         );
 
         if (occupancy.rows[0].filled > 0) {
+            await client.query("ROLLBACK");
             return sendErrorResponse(
                 res,
                 409,
@@ -688,23 +699,53 @@ export const deleteRoom = async (req, res) => {
             );
         }
 
-        await pool.query(
+        // Delete the room.
+        await client.query(
             `DELETE FROM tbl_rooms
              WHERE room_id = $1`,
             [Number(roomId)]
         );
 
+        // Check whether any other rooms exist in this building.
+        const remainingRooms = await client.query(
+            `SELECT COUNT(*)::INTEGER AS total
+             FROM tbl_rooms
+             WHERE building_id = $1`,
+            [buildingId]
+        );
+
+        let buildingDeleted = false;
+
+        // Delete the building if no rooms remain.
+        if (remainingRooms.rows[0].total === 0) {
+            const building = await client.query(
+                `DELETE FROM tbl_buildings
+                 WHERE building_id = $1
+                 RETURNING building_id, building_name`,
+                [buildingId]
+            );
+
+            buildingDeleted = building.rowCount > 0;
+        }
+
+        await client.query("COMMIT");
+
         return sendSuccessResponse(
             res,
             200,
-            "Room deleted successfully"
+            buildingDeleted
+                ? "Room and its empty building deleted successfully"
+                : "Room deleted successfully"
         );
+
     } catch (error) {
+        await client.query("ROLLBACK");
+
         if (error.code === "23503") {
             return sendErrorResponse(
                 res,
                 409,
-                "Room is linked to other records and cannot be deleted"
+                "Room or building is linked to other records and cannot be deleted"
             );
         }
 
@@ -715,8 +756,12 @@ export const deleteRoom = async (req, res) => {
             500,
             "Internal server error"
         );
+
+    } finally {
+        client.release();
     }
 };
+
 
 export const getRoomSummary = async (req, res) => {
     try {
