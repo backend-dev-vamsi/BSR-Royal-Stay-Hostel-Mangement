@@ -377,16 +377,15 @@ export const getRoomById = async (req, res) => {
     }
 };
 
+
 export const updateRoom = async (req, res) => {
+    const client = await pool.connect();
+
     try {
         const { roomId } = req.params;
 
         if (!/^[1-9]\d*$/.test(roomId)) {
-            return sendErrorResponse(
-                res,
-                400,
-                "Invalid room ID"
-            );
+            return sendErrorResponse(res, 400, "Invalid room ID");
         }
 
         const allowedFields = {
@@ -427,10 +426,15 @@ export const updateRoom = async (req, res) => {
             status: value =>
                 ["ACTIVE", "MAINTENANCE", "INACTIVE"].includes(value)
                     ? value
+                    : undefined,
+
+            building_name: value =>
+                typeof value === "string" && value.trim()
+                    ? value.trim()
                     : undefined
         };
 
-        const fields = Object.keys(req.body);
+        const fields = Object.keys(req.body || {});
 
         if (fields.length === 0) {
             return sendErrorResponse(
@@ -462,36 +466,47 @@ export const updateRoom = async (req, res) => {
                 );
             }
 
-            updates.push(`${field} = $${values.length + 1}`);
-            values.push(normalized);
+            if (field !== "building_name") {
+                updates.push(`${field} = $${values.length + 1}`);
+                values.push(normalized);
+            }
         }
 
-        const currentRoom = await pool.query(
-            `SELECT room_id, sharing_type, status
+        await client.query("BEGIN");
+
+        const currentRoom = await client.query(
+            `SELECT room_id, building_id, sharing_type, status
              FROM tbl_rooms
-             WHERE room_id = $1`,
+             WHERE room_id = $1
+             FOR UPDATE`,
             [Number(roomId)]
         );
 
         if (currentRoom.rowCount === 0) {
-            return sendErrorResponse(
-                res,
-                404,
-                "Room not found"
-            );
+            await client.query("ROLLBACK");
+            return sendErrorResponse(res, 404, "Room not found");
         }
 
-        // Validate a new building ID, if supplied.
+        const room = currentRoom.rows[0];
+
+        // Determine the building to update.
+        const targetBuildingId =
+            req.body.building_id !== undefined
+                ? Number(req.body.building_id)
+                : room.building_id;
+
+        // Validate building ID if supplied.
         if (req.body.building_id !== undefined) {
-            const building = await pool.query(
+            const building = await client.query(
                 `SELECT building_id
                  FROM tbl_buildings
                  WHERE building_id = $1
                    AND status = 'ACTIVE'`,
-                [Number(req.body.building_id)]
+                [targetBuildingId]
             );
 
             if (building.rowCount === 0) {
+                await client.query("ROLLBACK");
                 return sendErrorResponse(
                     res,
                     400,
@@ -500,9 +515,33 @@ export const updateRoom = async (req, res) => {
             }
         }
 
-        // Prevent capacity from falling below occupied beds.
+        // Update building name if supplied.
+        if (req.body.building_name !== undefined) {
+            const buildingUpdate = await client.query(
+                `UPDATE tbl_buildings
+                 SET building_name = $1,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE building_id = $2
+                 RETURNING building_id, building_name`,
+                [
+                    req.body.building_name.trim(),
+                    targetBuildingId
+                ]
+            );
+
+            if (buildingUpdate.rowCount === 0) {
+                await client.query("ROLLBACK");
+                return sendErrorResponse(
+                    res,
+                    404,
+                    "Building not found"
+                );
+            }
+        }
+
+        // Validate occupied beds before reducing sharing capacity.
         if (req.body.sharing_type !== undefined) {
-            const occupancy = await pool.query(
+            const occupancy = await client.query(
                 `SELECT COUNT(*)::INTEGER AS filled
                  FROM tbl_room_allocations
                  WHERE room_id = $1
@@ -514,6 +553,7 @@ export const updateRoom = async (req, res) => {
                 Number(req.body.sharing_type) <
                 occupancy.rows[0].filled
             ) {
+                await client.query("ROLLBACK");
                 return sendErrorResponse(
                     res,
                     409,
@@ -522,12 +562,12 @@ export const updateRoom = async (req, res) => {
             }
         }
 
-        // Do not deactivate a room that has active occupants.
+        // Prevent deactivation or maintenance when occupants exist.
         if (
             req.body.status !== undefined &&
             req.body.status !== "ACTIVE"
         ) {
-            const occupancy = await pool.query(
+            const occupancy = await client.query(
                 `SELECT COUNT(*)::INTEGER AS filled
                  FROM tbl_room_allocations
                  WHERE room_id = $1
@@ -536,6 +576,7 @@ export const updateRoom = async (req, res) => {
             );
 
             if (occupancy.rows[0].filled > 0) {
+                await client.query("ROLLBACK");
                 return sendErrorResponse(
                     res,
                     409,
@@ -544,29 +585,41 @@ export const updateRoom = async (req, res) => {
             }
         }
 
-        updates.push("updated_at = CURRENT_TIMESTAMP");
-        values.push(Number(roomId));
+        let updatedRoom = room;
 
-        const result = await pool.query(
-            `UPDATE tbl_rooms
-             SET ${updates.join(", ")}
-             WHERE room_id = $${values.length}
-             RETURNING *`,
-            values
-        );
+        // Update room only when room fields are supplied.
+        if (updates.length > 0) {
+            updates.push("updated_at = CURRENT_TIMESTAMP");
+            values.push(Number(roomId));
+
+            const result = await client.query(
+                `UPDATE tbl_rooms
+                 SET ${updates.join(", ")}
+                 WHERE room_id = $${values.length}
+                 RETURNING *`,
+                values
+            );
+
+            updatedRoom = result.rows[0];
+        }
+
+        await client.query("COMMIT");
 
         return sendSuccessResponse(
             res,
             200,
-            "Room updated successfully"
-            // result.rows[0]
+            "Room updated successfully",
+            updatedRoom
         );
+
     } catch (error) {
+        await client.query("ROLLBACK");
+
         if (error.code === "23505") {
             return sendErrorResponse(
                 res,
                 409,
-                "Room number already exists in this building"
+                "Room number or building name already exists"
             );
         }
 
@@ -585,8 +638,12 @@ export const updateRoom = async (req, res) => {
             500,
             "Internal server error"
         );
+
+    } finally {
+        client.release();
     }
 };
+
 
 export const deleteRoom = async (req, res) => {
     try {
