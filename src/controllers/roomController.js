@@ -657,8 +657,9 @@ export const deleteRoom = async (req, res) => {
             );
         }
 
+        // Check room existence and get building ID.
         const room = await pool.query(
-            `SELECT room_id
+            `SELECT room_id, building_id
              FROM tbl_rooms
              WHERE room_id = $1`,
             [Number(roomId)]
@@ -672,6 +673,9 @@ export const deleteRoom = async (req, res) => {
             );
         }
 
+        const buildingId = room.rows[0].building_id;
+
+        // Prevent deletion if active hostellers exist.
         const occupancy = await pool.query(
             `SELECT COUNT(*)::INTEGER AS filled
              FROM tbl_room_allocations
@@ -688,17 +692,45 @@ export const deleteRoom = async (req, res) => {
             );
         }
 
+        // Count other rooms in the same building.
+        const remainingRooms = await pool.query(
+            `SELECT COUNT(*)::INTEGER AS total
+             FROM tbl_rooms
+             WHERE building_id = $1
+               AND room_id != $2`,
+            [buildingId, Number(roomId)]
+        );
+
+        // Delete the selected room.
         await pool.query(
             `DELETE FROM tbl_rooms
              WHERE room_id = $1`,
             [Number(roomId)]
         );
 
+        // If it was the last room, deactivate the building.
+        if (Number(remainingRooms.rows[0].total) === 0) {
+            await pool.query(
+                `UPDATE tbl_buildings
+                 SET status = 'INACTIVE',
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE building_id = $1`,
+                [buildingId]
+            );
+
+            return sendSuccessResponse(
+                res,
+                200,
+                "Room deleted and building marked as inactive"
+            );
+        }
+
         return sendSuccessResponse(
             res,
             200,
             "Room deleted successfully"
         );
+
     } catch (error) {
         if (error.code === "23503") {
             return sendErrorResponse(
@@ -717,6 +749,7 @@ export const deleteRoom = async (req, res) => {
         );
     }
 };
+
 
 
 export const getRoomSummary = async (req, res) => {
